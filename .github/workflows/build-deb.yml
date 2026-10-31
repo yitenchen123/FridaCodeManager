@@ -5,7 +5,7 @@ name: Build deb
 #
 # 说明：
 #   deb 里的 Swift 部分必须由 iOS/macOS 上的 swiftc 编译（Swift 不支持从 Linux 交叉编译到 iOS），
-#   所以这里用 macos-13 runner（x86_64，可跑 iOS SDK + ldid 交叉编译），产出 arm64 的越狱包。
+#   所以这里用 macos-15 runner（arm64，与越狱设备同架构，可直接编 arm64 越狱包）。
 #   若某步缺依赖不会静默跳过，会直接失败并在日志里给出中文提示。
 
 on:
@@ -27,7 +27,7 @@ permissions:
 jobs:
   build:
     name: deb (${{ inputs.jailbreak || 'rootless' }})
-    runs-on: macos-13
+    runs-on: macos-15
     timeout-minutes: 60
 
     env:
