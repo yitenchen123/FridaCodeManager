@@ -1,0 +1,124 @@
+name: Build deb
+
+# 手动触发：Actions → Build deb → Run workflow
+# 也可以用 gh workflow run build-deb.yml --ref zh-cn
+#
+# 说明：
+#   deb 里的 Swift 部分必须由 iOS/macOS 上的 swiftc 编译（Swift 不支持从 Linux 交叉编译到 iOS），
+#   所以这里用 macos-13 runner（x86_64，可跑 iOS SDK + ldid 交叉编译），产出 arm64 的越狱包。
+#   若某步缺依赖不会静默跳过，会直接失败并在日志里给出中文提示。
+
+on:
+  workflow_dispatch:
+    inputs:
+      jailbreak:
+        description: '越狱类型'
+        required: true
+        default: rootless
+        type: choice
+        options: [rootless, roothide]
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: deb (${{ inputs.jailbreak || 'rootless' }})
+    runs-on: macos-13
+    timeout-minutes: 60
+
+    env:
+      JB: ${{ inputs.jailbreak || 'rootless' }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 环境自检（Runner 信息）
+        run: |
+          uname -a
+          sw_vers || true
+          xcodebuild -version || true
+          echo "swiftc: $(which swiftc || echo 未找到)"
+          swiftc --version || true
+
+      - name: 安装依赖（ldid / dpkg / unzip）
+        run: |
+          set -eux
+          brew install ldid || true
+          brew list ldid >/dev/null 2>&1 || { echo "::error::ldid 安装失败"; exit 1; }
+          which ldid dpkg-deb unzip
+
+      - name: 准备 iOS SDK
+        run: |
+          set -eux
+          # 仓库自带的 iOS15.6 SDK（Makefile 的 greet 目标也会用这个）
+          ZIP="FCM/UI/TabBar/Settings/SDKHub/sdk/iOS15.6.zip"
+          if [ -f "$ZIP" ]; then
+            rm -rf SDK .sdk_tmp && mkdir .sdk_tmp
+            unzip -q "$ZIP" -d .sdk_tmp
+            mv .sdk_tmp/iPhoneOS15.6.sdk SDK
+            rm -rf .sdk_tmp
+            # MobileContainerManager 需要从 PrivateFrameworks 移到 Frameworks
+            if [ -d "SDK/System/Library/PrivateFrameworks/MobileContainerManager.framework" ]; then
+              mv SDK/System/Library/PrivateFrameworks/MobileContainerManager.framework \
+                 SDK/System/Library/Frameworks/MobileContainerManager.framework
+            fi
+            echo "使用仓库内置 SDK: $(ls SDK | head)"
+          else
+            echo "::error::仓库缺少 iOS SDK 压缩包，无法编译 Swift"
+            exit 1
+          fi
+
+      - name: 准备 theos headers
+        run: |
+          set -eux
+          TARGET="Blueprint/FridaCodeManager.app/include"
+          if [ ! -d "$TARGET" ]; then
+            git clone --depth 1 https://github.com/theos/headers.git .headers
+            mv .headers "$TARGET"
+          fi
+          ls "$TARGET" | head
+
+      - name: 预编译库检查
+        run: |
+          set -eux
+          for lib in libzip libroot libfcm; do
+            ls -l "Essentials/lib/prebuild/$lib.a" || true
+          done
+          test -f Essentials/lib/prebuild/libzip.a || { echo "::error::缺少 libzip.a"; exit 1; }
+
+      - name: 构建 deb
+        run: |
+          set -eux
+          # 上游 Makefile 里 SHELL 写死 /var/jb/bin/sh 或 /bin/sh，macOS 上走 /bin/sh 分支
+          if [ "$JB" = "roothide" ]; then
+            make roothide
+          else
+            make all
+          fi
+
+      - name: 校验产物
+        run: |
+          set -eux
+          ls -lh Product/
+          DEB=$(ls Product/*.deb | head -n 1)
+          dpkg-deb -I "$DEB"
+          dpkg-deb -c "$DEB" | head -30
+          # 确认可执行文件存在且是 arm64
+          dpkg-deb -c "$DEB" | grep -q swifty || { echo "::error::deb 内没有主程序 swifty"; exit 1; }
+          rm -rf .unpack && mkdir .unpack
+          dpkg-deb -x "$DEB" .unpack
+          file .unpack/*/Applications/FridaCodeManager.app/swifty || \
+            file .unpack/Applications/FridaCodeManager.app/swifty || true
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: FridaCodeManager-deb-${{ inputs.jailbreak || 'rootless' }}
+          path: Product/*.deb
+          if-no-files-found: error
+          retention-days: 30
