@@ -64,7 +64,19 @@ package_fs:
 	@find . -type f -name ".DS_Store" -delete
 	@cp -r Blueprint/FridaCodeManager.app/* $(BUILD_PATH)$(JB_PATH)Applications/FridaCodeManager.app
 	@mkdir -p $(BUILD_PATH)DEBIAN
-	@echo "Package: com.sparklechan.swifty\nName: FridaCodeManager\nVersion: $(VERSION)\nArchitecture: $(ARCH)\nDescription: Full fledged Xcode-like IDE for iOS\nDepends: swift, clang-14, ldid, git\nIcon: https://raw.githubusercontent.com/fridakitten/FridaCodeManager/main/Blueprint/FridaCodeManager.app/AppIcon.png\nConflicts: com.sparklechan.sparkkit\nMaintainer: FCCT\nAuthor: FCCT\nSection: Utilities\nTag: role::hacker" > $(BUILD_PATH)DEBIAN/control
+	@printf '%s\n' \
+		'Package: com.sparklechan.swifty' \
+		'Name: FridaCodeManager' \
+		'Version: $(VERSION)' \
+		'Architecture: $(ARCH)' \
+		'Description: 类 Xcode 的 iOS 端开发 IDE（简体中文汉化版）' \
+		'Depends: swift, clang-14, ldid, git' \
+		'Icon: https://raw.githubusercontent.com/fridakitten/FridaCodeManager/main/Blueprint/FridaCodeManager.app/AppIcon.png' \
+		'Conflicts: com.sparklechan.sparkkit' \
+		'Maintainer: FCCT' \
+		'Author: FCCT' \
+		'Section: Utilities' \
+		'Tag: role::hacker' > $(BUILD_PATH)DEBIAN/control
 	@-rm -rf Product/*
 	@dpkg-deb -b $(BUILD_PATH) Product/FridaCodeManager.deb
 
