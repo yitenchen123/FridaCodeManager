@@ -98,6 +98,20 @@ jobs:
           done
           test -f Essentials/lib/prebuild/libzip.a || { echo "::error::缺少 libzip.a"; exit 1; }
 
+      - name: 补充构建工具（uuid 命令）
+        run: |
+          set -eux
+          # Essentials/libfcm/Makefile 用 `uuid` 生成目标文件名，越狱设备自带该命令，macOS 没有
+          if ! command -v uuid >/dev/null 2>&1; then
+            # 放进临时 bin 目录，避免污染系统路径
+            mkdir -p "$RUNNER_TEMP/bin"
+            printf '#!/bin/sh\nexec uuidgen\n' > "$RUNNER_TEMP/bin/uuid"
+            chmod +x "$RUNNER_TEMP/bin/uuid"
+            echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          fi
+          command -v uuid || true
+          uuid
+
       - name: 构建 deb
         run: |
           set -eux
