@@ -22,14 +22,14 @@ struct SDKDownload: View {
                 }
             }
         }
-        .navigationTitle("SDK Hub")
+        .navigationTitle("SDK 中心")
         .navigationBarTitleDisplayMode(.inline)
         .id(listid)
     }
 
     private func download(_ sdk: String) -> Void {
         DispatchQueue.global(qos: .utility).async {
-            ShowAlert(UIAlertController(title: "Downloading SDK", message: "", preferredStyle: .alert))
+            ShowAlert(UIAlertController(title: "正在下载 SDK…", message: "", preferredStyle: .alert))
             cfolder(atPath: "\(global_sdkpath)")
             fdownload("https://raw.githubusercontent.com/fridakitten/FridaCodeManager/main/FCM/UI/TabBar/Settings/SDKHub/sdk/iOS\(sdk).zip", "tmp/sdk.zip")
             if libzip_unzip("\(global_container)/tmp/sdk.zip","\(global_sdkpath)") != 0 {
@@ -49,7 +49,7 @@ struct SDKDownload: View {
 
     private func remove(_ sdk: String) -> Void {
         DispatchQueue.global(qos: .utility).async {
-            ShowAlert(UIAlertController(title: "Removing SDK", message: "", preferredStyle: .alert))
+            ShowAlert(UIAlertController(title: "正在移除 SDK…", message: "", preferredStyle: .alert))
             // some people might have downloaded SDKs in the past that got unnecessarily stored as root
             if rm("\(global_sdkpath)/iPhoneOS\(sdk).sdk") != 0 {
                 #if !stock

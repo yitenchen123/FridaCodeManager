@@ -35,28 +35,28 @@ struct SFSymbolView: View {
     var body: some View {
         List {
             NavigationLink( destination: SFSymbolListView(symbols: gSFSymbols())) {
-                Text("All")
+                Text("全部")
             }
-            Section(header: Text("categories")) {
+            Section(header: Text("分类")) {
                 NavigationLink( destination: SFSymbolListView(symbols: gcommunication())) {
-                    Label("Communication",systemImage: "bubble.left.and.bubble.right.fill")
+                    Label("通讯",systemImage: "bubble.left.and.bubble.right.fill")
                 }
                 NavigationLink( destination: SFSymbolListView(symbols: gweather())) {
-                    Label("Weather",systemImage: "cloud.moon.rain.fill")
+                    Label("天气",systemImage: "cloud.moon.rain.fill")
                 }
                 NavigationLink( destination: SFSymbolListView(symbols: gdevices())) {
-                    Label("Devices",systemImage: "airpodspro")
+                    Label("设备",systemImage: "airpodspro")
                 }
                 NavigationLink( destination: SFSymbolListView(symbols: gconnectivity())) {
-                    Label("Connectivity",systemImage: "network")
+                    Label("连接",systemImage: "network")
                 }
                 NavigationLink( destination: SFSymbolListView(symbols: gnature())) {
-                    Label("Nature",systemImage: "leaf.fill")
+                    Label("自然",systemImage: "leaf.fill")
                 }
             }
         }
         .listStyle(InsetGroupedListStyle())
-        .navigationBarTitle("SFSymbols")
+        .navigationBarTitle("SF 符号")
         .navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -76,7 +76,7 @@ struct SFSymbolListView: View {
                 }
             }
         }
-        .navigationBarTitle("SFSymbols")
+        .navigationBarTitle("SF 符号")
         .navigationBarTitleDisplayMode(.inline)
         .listStyle(InsetGroupedListStyle())
     }

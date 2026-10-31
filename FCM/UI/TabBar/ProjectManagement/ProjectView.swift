@@ -64,12 +64,12 @@ struct ProjectView: View {
                                         Button(action: {
                                             app_btn(Project)
                                         }) {
-                                            Label("Export App", systemImage: "app")
+                                            Label("导出 App", systemImage: "app")
                                         }
                                         Button(action: {
                                             proj_btn(Project)
                                         }) {
-                                            Label("Export Project", systemImage: "archivebox")
+                                            Label("导出工程", systemImage: "archivebox")
                                         }
                                     }
                                     Button(action: {
@@ -77,7 +77,7 @@ struct ProjectView: View {
                                         projrname = Project.Executable
                                         Prefs = true
                                     }) {
-                                        Label("Project Preferences", systemImage: "gear")
+                                        Label("工程设置", systemImage: "gear")
                                     }
                                     Section {
                                         Button(role: .destructive, action: {
@@ -87,7 +87,7 @@ struct ProjectView: View {
                                                 Removal = true
                                             }
                                         }) {
-                                            Label("Remove", systemImage: "trash")
+                                            Label("删除", systemImage: "trash")
                                         }
                                     }
                                 }
@@ -97,7 +97,7 @@ struct ProjectView: View {
                 }
             }
             .listStyle(InsetGroupedListStyle())
-            .navigationTitle("Projects")
+            .navigationTitle("项目")
             .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $Prefs) {
                 ProjPreferences(ProjectName: $projname, hello: $hello, rname: $projrname)
@@ -230,7 +230,7 @@ struct buildView: View {
                     #endif
                     DispatchQueue.main.async {
                         if status == 0 {
-                            Cache.append(logstruct(file: " ", line: 0, level: -1, description: "Success", detail: "successfully build app"))
+                            Cache.append(logstruct(file: " ", line: 0, level: -1, description: "成功", detail: "App 构建成功"))
                             #if !stock
                             if ProjectInfo.TYPE == "Applications" {
                                 OpenApp(ProjectInfo.BundleID)
@@ -240,11 +240,11 @@ struct buildView: View {
                             #endif
                         } else {
                             if Cache.isEmpty {
-                                Cache.append(logstruct(file: " ", line: 0, level: 2, description: "Fatal Error", detail: "none-zero compiler return, for more details switch to log mode"))
+                                Cache.append(logstruct(file: " ", line: 0, level: 2, description: "致命错误", detail: "编译器返回值非零，更多信息请切换到日志模式查看"))
                             }
                         }
                         withAnimation {
-                            BVstatus = "Done"
+                            BVstatus = "完成"
                             BVprogress = 1.0
                             compiling = false
                         }
@@ -275,7 +275,7 @@ struct buildView: View {
 
 func copyToClipboard(text: String, alert: Bool? = true) {
     haptfeedback(1)
-    if (alert ?? true) {ShowAlert(UIAlertController(title: "Copied", message: "", preferredStyle: .alert))}
+    if (alert ?? true) {ShowAlert(UIAlertController(title: "已复制", message: "", preferredStyle: .alert))}
     UIPasteboard.general.string = text
     if (alert ?? true) {DismissAlert()}
 }

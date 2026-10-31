@@ -8,7 +8,7 @@ struct POButtonBar: View {
             Button(action: {
                 cancel()
             }, label: {
-                Text("Cancel")
+                Text("取消")
             })
             .frame(width: 80, height: 36)
             .background(Color(.systemBackground).opacity(0.7))
@@ -18,7 +18,7 @@ struct POButtonBar: View {
             Button(action: {
                 confirm()
             }, label: {
-                Text("Confirm")
+                Text("确认")
             })
             .frame(width: 80, height: 36)
             .background(Color(.systemBackground).opacity(0.7))

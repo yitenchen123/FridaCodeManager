@@ -35,43 +35,43 @@ struct Frida: View {
 
     var credits = {
         var save = [
-            ("SeanIsTethered", "Main Developer", "https://github.com/seanistethered.png"),
-            ("AppInstaller iOS", "Developer", "https://github.com/AppInstalleriOSGH.png"),
-            ("RoothideDev", "Contributor", "https://github.com/roothide.png"),
-            ("Lorenzo Ferron", "Contributor", "https://github.com/miticollo.png"),
-            ("Paolo Forni", "Contributor", "https://github.com/Pe13.png"),
-            ("Manuel Chakravarty", "Contributor", "https://github.com/mchakravarty.png"),
-            ("Ayame Yumemi", "Icon Designer", "https://github.com/ayayame09.png")
+            ("SeanIsTethered", "主要开发者", "https://github.com/seanistethered.png"),
+            ("AppInstaller iOS", "开发者", "https://github.com/AppInstalleriOSGH.png"),
+            ("RoothideDev", "贡献者", "https://github.com/roothide.png"),
+            ("Lorenzo Ferron", "贡献者", "https://github.com/miticollo.png"),
+            ("Paolo Forni", "贡献者", "https://github.com/Pe13.png"),
+            ("Manuel Chakravarty", "贡献者", "https://github.com/mchakravarty.png"),
+            ("Ayame Yumemi", "图标设计", "https://github.com/ayayame09.png")
         ]
         if UserDefaults.standard.bool(forKey: "GIT_ENABLED") {
             if let gitToken = UserDefaults.standard.string(forKey: "GIT_TOKEN"),
                 let user = getGithubUsername(fromToken: gitToken) {
-                save.append((user, "User", "https://github.com/\(user).png"))
+                save.append((user, "用户", "https://github.com/\(user).png"))
             }
         }
         return save
     }()
 
     private let sideCredits = [
-        ("Opa334", "Trollstore Helper", "https://github.com/opa334.png"),
+        ("Opa334", "TrollStore 支持", "https://github.com/opa334.png"),
         ("Theos", "SDK", "https://github.com/theos.png")
     ]
 
     private let others = [
-        ("Chariz", "Repo Host", "https://github.com/chariz.png")
+        ("Chariz", "软件源托管", "https://github.com/chariz.png")
     ]
 
     var body: some View {
         NavigationView {
             List {
-                Section(header: Text("About")) {
+                Section(header: Text("关于")) {
                     Text("FridaCodeManager \(global_version)")
                 }
 
                 ForEach([
-                    ("Credits", credits),
-                    ("Side Credits", sideCredits),
-                    ("Others", others)
+                    ("鸣谢", credits),
+                    ("协助", sideCredits),
+                    ("其他", others)
                 ], id: \.0) { sectionTitle, sectionCredits in
                     Section(header: Text(sectionTitle)) {
                         ForEach(sectionCredits.indices, id: \.self) { index in
@@ -95,7 +95,7 @@ struct Frida: View {
                 }
             }
             .id(hello)
-            .navigationTitle("About")
+            .navigationTitle("关于")
             .navigationBarTitleDisplayMode(.inline)
             .listStyle(InsetGroupedListStyle())
         }

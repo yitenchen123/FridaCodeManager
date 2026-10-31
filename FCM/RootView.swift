@@ -38,11 +38,11 @@ struct RootView: View {
         TabView {
             Home(hellnah: $project_list_id)
                 .tabItem {
-                    Label("Home", systemImage: "house")
+                    Label("主页", systemImage: "house")
                 }
             ProjectView(hello: $project_list_id, Projects: $projects)
                 .tabItem {
-                    Label("Projects", systemImage: "folder")
+                    Label("项目", systemImage: "folder")
                 }
             /*WikiView()
                 .tabItem {
@@ -50,7 +50,7 @@ struct RootView: View {
                 }*/
             Settings()
                 .tabItem {
-                    Label("Settings", systemImage: "gear")
+                    Label("设置", systemImage: "gear")
                 }
         }
         .accentColor(.primary)

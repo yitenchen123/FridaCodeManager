@@ -142,7 +142,7 @@ struct NavigationBarViewControllerRepresentable: UIViewControllerRepresentable {
             }
         }
 
-        let closeButton = ClosureBarButtonItem(title: "Close", style: .plain) {
+        let closeButton = ClosureBarButtonItem(title: "关闭", style: .plain) {
             textView.endEditing(true)
             isPresented = false
         }
@@ -303,13 +303,13 @@ struct NeoEditor: UIViewRepresentable {
 
         let flexibleSpace = UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil)
 
-        let action1 = UIAction(title: "Go To Line", image: UIImage(systemName: "arrow.right")) { _ in
+        let action1 = UIAction(title: "跳转到行", image: UIImage(systemName: "arrow.right")) { _ in
             toolbarItemCache = toolbar.items ?? []
 
             self.animateToolbarItemsDisappearance {
                 let textField = UITextField()
                 textField.text = ""
-                textField.placeholder = "Line number to jump to"
+                textField.placeholder = "输入要跳转到的行号"
                 textField.borderStyle = .roundedRect
                 textField.keyboardType = .asciiCapable
                 textField.textContentType = .none
@@ -318,12 +318,12 @@ struct NeoEditor: UIViewRepresentable {
                 textField.smartInsertDeleteType = .no
                 textField.autocorrectionType = .no
                 textField.autocapitalizationType = .none
-                let doneButton = ClosureButton(title: "Cancel") {
+                let doneButton = ClosureButton(title: "取消") {
                     self.animateToolbarItemsDisappearance {
                         self.restoreToolbarItems()
                     }
                 }
-                let gotoButton = ClosureButton(title: "Goto") {
+                let gotoButton = ClosureButton(title: "跳转") {
                     guard let lineNumber = Int(textField.text ?? "n/a") else { return }
                     guard let textView = textView as? CustomTextView else { return }
                     guard let askedRange: NSRange = textView.rangeOfLine(lineNumber: lineNumber - 1) else { return }
@@ -354,12 +354,12 @@ struct NeoEditor: UIViewRepresentable {
             }
         }
 
-        let action2 = UIAction(title: "Search String", image: UIImage(systemName: "magnifyingglass")) { _ in
+        let action2 = UIAction(title: "查找字符串", image: UIImage(systemName: "magnifyingglass")) { _ in
             toolbarItemCache = toolbar.items ?? []
             self.animateToolbarItemsDisappearance {
                 let textField = UITextField()
                 textField.text = ""
-                textField.placeholder = "String to search"
+                textField.placeholder = "输入要查找的内容"
                 textField.borderStyle = .roundedRect
                 textField.keyboardType = .asciiCapable
                 textField.textContentType = .none
@@ -368,7 +368,7 @@ struct NeoEditor: UIViewRepresentable {
                 textField.smartInsertDeleteType = .no
                 textField.autocorrectionType = .no
                 textField.autocapitalizationType = .none
-                let doneButton = ClosureButton(title: "Close") {
+                let doneButton = ClosureButton(title: "关闭") {
                     if !highlightLayerCache.isEmpty {
                         for item in highlightLayerCache {
                             item.removeFromSuperlayer()
@@ -378,7 +378,7 @@ struct NeoEditor: UIViewRepresentable {
                         self.restoreToolbarItems()
                     }
                 }
-                let searchButton = ClosureButton(title: "Search") {
+                let searchButton = ClosureButton(title: "查找") {
                     guard let string = textField.text else { return }
                     guard let textView = textView as? CustomTextView else { return }
                     if !highlightLayerCache.isEmpty {
@@ -404,10 +404,10 @@ struct NeoEditor: UIViewRepresentable {
             }
         }
 
-        let menu = UIMenu(title: "Tools", children: [action2, action1])
+        let menu = UIMenu(title: "工具", children: [action2, action1])
         let menuButton = UIButton(type: .system)
         menuButton.tintColor = UIColor.label
-        menuButton.setTitle("Tools", for: .normal)
+        menuButton.setTitle("工具", for: .normal)
         menuButton.menu = menu
         menuButton.showsMenuAsPrimaryAction = true
         let menuBarButtonItem = UIBarButtonItem(customView: menuButton)
@@ -1317,34 +1317,34 @@ struct NeoEditorSettings: View {
     @AppStorage("CECurrentLineHighlighting") var current_line_highlighting: Bool = false
     var body: some View {
         List {
-            Section(header: Text("Themes")) {
-                Button("Default") {
+            Section(header: Text("主题")) {
+                Button("默认") {
                     setTheme(0)
                     storeTheme()
                 }
-                Button("Dusk") {
+                Button("暮色") {
                     setTheme(1)
                     storeTheme()
                 }
-                Button("Midnight") {
+                Button("午夜") {
                     setTheme(2)
                     storeTheme()
                 }
             }
-            Section(header: Text("Advanced Graphic Settings")) {
+            Section(header: Text("高级显示设置")) {
                 HStack {
                     Text("Render: \(NumberFormatter.localizedString(from: NSNumber(value: render), number: .percent))")
                         .frame(width: 150)
                     Slider(value: $render, in: 0...1)
                 }
                 Stepper("Font Size: \(String(Int(font)))", value: $font, in: 0...20)
-                Toggle("Line Highlighting", isOn: $current_line_highlighting)
+                Toggle("高亮当前行", isOn: $current_line_highlighting)
                     .disabled(isPad)
-                Toggle("Toolbar", isOn: $toolbar)
-                Toggle("Autocomplete", isOn: $autocomplete)
+                Toggle("工具栏", isOn: $toolbar)
+                Toggle("自动补全", isOn: $autocomplete)
             }
         }
-        .navigationTitle("Code Editor")
+        .navigationTitle("代码编辑器")
         .navigationBarTitleDisplayMode(.inline)
         .listStyle(InsetGroupedListStyle())
     }

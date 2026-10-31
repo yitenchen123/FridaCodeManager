@@ -60,7 +60,7 @@ struct POPicker: View {
             Button(action: {
                 function()
             }, label: {
-                Text("Submit")
+                Text("提交")
                     .frame(width: 80, height: 36)
                     .background(Color(.systemBackground).opacity(0.7))
                     .foregroundColor(.primary)

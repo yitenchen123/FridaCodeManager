@@ -11,16 +11,16 @@ struct ExperimentalSettingsBundle: View {
                 Toggle("Typecheck Code", isOn: $typecheck)
             }*/
             Section(header: Text("GitHub")) {
-                Toggle("Enabled", isOn: $enabled)
+                Toggle("启用", isOn: $enabled)
                 if enabled {
-                    SecureField("Token", text: $token)
+                    SecureField("访问令牌", text: $token)
                 }
             }
             NavigationLink(destination: DumpLogBundleMain()) {
-                Label("Logging System (DEBUG)", systemImage: "doc.fill")
+                Label("日志系统（调试）", systemImage: "doc.fill")
             }
         }
-        .navigationTitle("Experimental")
+        .navigationTitle("实验性功能")
         .navigationBarTitleDisplayMode(.inline)
     }
 }

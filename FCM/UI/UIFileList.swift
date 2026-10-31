@@ -123,7 +123,7 @@ struct FileList: View {
                                 potextfield = selpath
                                 activeSheet = .rename
                             }) {
-                                Label("Rename", systemImage: "pencil")
+                                Label("重命名", systemImage: "pencil")
                             }
                         }
                         Section {
@@ -131,20 +131,20 @@ struct FileList: View {
                                 actpath = item.path
                                 action = 1
                             }) {
-                                Label("Copy", systemImage: "doc.on.doc.fill")
+                                Label("复制", systemImage: "doc.on.doc.fill")
                             }
                             Button(action: {
                                 actpath = item.path
                                 action = 2
                             }) {
-                                Label("Move", systemImage: "folder.fill")
+                                Label("移动", systemImage: "folder.fill")
                             }
                         }
                         Section {
                             Button( action: {
                                 share(url: item, remove: false)
                             }) {
-                                Label("Share", systemImage: "square.and.arrow.up.fill")
+                                Label("分享", systemImage: "square.and.arrow.up.fill")
                             }
                         }
                         Section {
@@ -153,7 +153,7 @@ struct FileList: View {
                                 activeSheet = .remove
                                 poheader = "Remove \"\(item.lastPathComponent)\"?"
                             }) {
-                                Label("Remove", systemImage: "trash.fill")
+                                Label("删除", systemImage: "trash.fill")
                             }
                         }
                     }
@@ -196,7 +196,7 @@ struct FileList: View {
                             Button(action: {
                                 buildv.wrappedValue = true
                             }) {
-                                Label("Build", systemImage: "play.fill")
+                                Label("构建", systemImage: "play.fill")
                             }
                         }
                         Section {
@@ -220,13 +220,13 @@ struct FileList: View {
                                     }
                                 }
                             } label: {
-                                Label("Macro", systemImage: "scope")
+                                Label("宏", systemImage: "scope")
                             }
                             if enabled {
                                 Menu {
                                     if !FileManager.default.fileExists(atPath: "\(project.ProjectPath)/.git") {
-                                        Button("Create Repo") {
-                                            ShowAlert(UIAlertController(title: "Creating Repository", message: "", preferredStyle: .alert))
+                                        Button("创建仓库") {
+                                            ShowAlert(UIAlertController(title: "正在创建仓库…", message: "", preferredStyle: .alert))
                                             DispatchQueue.global(qos: .utility).async {
                                                 let result = createGitHubRepository(repositoryName: project.Executable, isPrivate: true, githubToken: token)
                                                 if result == 0 {
@@ -259,7 +259,7 @@ struct FileList: View {
                                             }
                                         }
                                     } else {
-                                        Button("Push") {
+                                        Button("推送") {
                                             DispatchQueue.global(qos: .utility).async {
                                                 guard let username = getGithubUsername(fromToken: token) else { return }
                                                 let remoteUrl = "https://\(username):\(token)@github.com/\(username)/\(project.Executable).git"
@@ -272,19 +272,19 @@ struct FileList: View {
                                                      """, uid: 501, env: [])
                                             }
                                         }
-                                        Button("Commit") {
+                                        Button("提交") {
                                             activeSheet = .commit
                                         }
                                         Section {
                                             Menu {
-                                                Button("Reset") {
+                                                Button("重置") {
                                                     shell("""
                                                               cd \(project.ProjectPath);
                                                               git reset --hard;
                                                           """)
                                                 }
                                             } label: {
-                                                Text("Advanced")
+                                                Text("高级")
                                             }
                                         }
                                     }
@@ -298,10 +298,10 @@ struct FileList: View {
                         Button(action: {
                             activeSheet = .impSheet
                         }) {
-                            Label("Import", systemImage: "square.and.arrow.down.fill")
+                            Label("导入", systemImage: "square.and.arrow.down.fill")
                         }
                         Button(action: { activeSheet = .create }) {
-                            Label("Create", systemImage: "doc.fill.badge.plus")
+                            Label("新建", systemImage: "doc.fill.badge.plus")
                         }
                     }
                     if action > 0 {
@@ -317,7 +317,7 @@ struct FileList: View {
                                 haptfeedback(1)
                                 bindLoadFiles(directoryPath: directoryPath, files: $files)
                             }) {
-                                Label("Paste", systemImage: "doc.on.clipboard")
+                                Label("粘贴", systemImage: "doc.on.clipboard")
                             }
                         }
                     }
@@ -332,20 +332,20 @@ struct FileList: View {
                      BottomPopupView {
                          switch sheet {
                             case .create:
-                                POHeader(title: "Create")
-                                POTextField(title: "Filename", content: $potextfield)
-                                POPicker(function: create_selected, title: "Type", arrays: [PickerArrays(title: "Type", items: [PickerItems(id: 0, name: "File"), PickerItems(id: 1, name: "Folder")])], type: $type)
+                                POHeader(title: "新建")
+                                POTextField(title: "文件名", content: $potextfield)
+                                POPicker(function: create_selected, title: "类型", arrays: [PickerArrays(title: "类型", items: [PickerItems(id: 0, name: "文件"), PickerItems(id: 1, name: "文件夹")])], type: $type)
                             case .rename:
-                                POHeader(title: "Rename")
-                                POTextField(title: "Filename", content: $potextfield)
+                                POHeader(title: "重命名")
+                                POTextField(title: "文件名", content: $potextfield)
                                 POButtonBar(cancel: dissmiss_sheet, confirm: rename_selected)
                             case .remove:
                                 POBHeader(title: $poheader)
                                 Spacer().frame(height: 10)
                                 POButtonBar(cancel: dissmiss_sheet, confirm: remove_selected)
                             case .commit:
-                                POHeader(title: "Commit")
-                                POTextField(title: "Name", content: $potextfield)
+                                POHeader(title: "提交")
+                                POTextField(title: "名称", content: $potextfield)
                                 POButtonBar(cancel: dissmiss_sheet, confirm: github_commit)
                             default:
                                 Spacer()
@@ -456,13 +456,13 @@ struct ImageView: View {
                         .aspectRatio(contentMode: .fit)
                         .frame(width: UIScreen.main.bounds.width)
                 }
-                .navigationBarTitle("Image Viewer", displayMode: .inline)
+                .navigationBarTitle("图片查看器", displayMode: .inline)
                 .navigationBarItems(leading:
                     Button(action: {
                         UIInit(type: 0)
                         fbool = false
                     }) {
-                        Text("Close")
+                        Text("关闭")
                     }
                 )
             }
@@ -503,7 +503,7 @@ struct SDKList: View {
         }
         .accentColor(.primary)
         .listStyle(InsetGroupedListStyle())
-        .navigationTitle("SDKs")
+        .navigationTitle("SDK 列表")
         .navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -668,9 +668,22 @@ struct DocumentPicker: UIViewControllerRepresentable {
         }
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            var imported = 0
+            var notes: [String] = []
             for item in urls {
-                _ = mv(item.path, "\(parent.pathURL.path)/\(item.lastPathComponent)")
+                let scope = item.startAccessingSecurityScopedResource()
+                if item.pathExtension.lowercased() == "zip" {
+                    let outcome = importArchiveInto(directory: parent.pathURL.path, archive: item.path)
+                    notes.append("\(item.lastPathComponent)：\(outcome.message)")
+                    if outcome.ok { imported += 1 }
+                } else {
+                    let dst = "\(parent.pathURL.path)/\(item.lastPathComponent)"
+                    if mv(item.path, dst) == 0 || cp(item.path, dst) == 0 { imported += 1 }
+                }
+                if scope { item.stopAccessingSecurityScopedResource() }
             }
+            if !notes.isEmpty { showAlert(with: notes.joined(separator: "\n")) }
+            haptfeedback(imported > 0 ? 1 : 2)
             parent.presentationMode.wrappedValue.dismiss()
         }
 

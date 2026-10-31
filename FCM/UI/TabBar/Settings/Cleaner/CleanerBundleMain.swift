@@ -6,21 +6,21 @@ struct Cleaner: View {
            Button(action: {
                clean(1)
            }) {
-               Label("Clean Module Cache", systemImage: "trash.fill")
+               Label("清理模块缓存", systemImage: "trash.fill")
            }
            Button(action: {
                clean(2)
            }) {
-               Label("Clean Temporary Data", systemImage: "trash.fill")
+               Label("清理临时数据", systemImage: "trash.fill")
            }
        }
-       .navigationTitle("Cleaner")
+       .navigationTitle("清理工具")
        .navigationBarTitleDisplayMode(.inline)
     }
 
     private func clean(_ arg: Int) {
         DispatchQueue.global(qos: .utility).async {
-            ShowAlert(UIAlertController(title: "Cleaning", message: "", preferredStyle: .alert))
+            ShowAlert(UIAlertController(title: "正在清理…", message: "", preferredStyle: .alert))
                 let path: String = {
                     switch(arg) {
                         case 1:

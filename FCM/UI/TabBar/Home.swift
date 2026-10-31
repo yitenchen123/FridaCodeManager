@@ -33,6 +33,8 @@ import UniformTypeIdentifiers
 
 struct Home: View {
     @State private var fileImporter = false
+    @State private var zipImporter = false
+    @State private var importing = false
     @State private var showProj = false
     @State private var about = false
     @State private var hello = UUID()
@@ -59,12 +61,19 @@ struct Home: View {
             .navigationTitle("FridaCodeManager")
             .navigationBarTitleDisplayMode(.inline)
             .fileImporter(isPresented: $fileImporter, allowedContentTypes: [.project], onCompletion: handleFileImport)
+            .fileImporter(isPresented: $zipImporter, allowedContentTypes: [.zip, .archive], allowsMultipleSelection: false, onCompletion: handleZipImport)
+            .disabled(importing)
+            .overlay {
+                if importing {
+                    importingOverlay
+                }
+            }
             .sheet(isPresented: $showProj) {
                 BottomPopupView {
-                    POHeader(title: "Create Project")
-                    POTextField(title: "Application Name", content: $AppName)
-                    POTextField(title: "Bundle Identifier", content: $BundleID)
-                    POPicker(function: createProject_trigger, title: "Scheme", arrays: [PickerArrays(title: "App", items: [PickerItems(id: 1, name: "Swift"), PickerItems(id: 2, name: "ObjC"), PickerItems(id: 3, name: "Swift/ObjC"), PickerItems(id: 5, name: "Swift/C++")]), PickerArrays(title: "Binary", items: [PickerItems(id: 4, name: "C")])], type: $type)
+                    POHeader(title: "新建工程")
+                    POTextField(title: "应用名称", content: $AppName)
+                    POTextField(title: "包标识符（Bundle ID）", content: $BundleID)
+                    POPicker(function: createProject_trigger, title: "类型", arrays: [PickerArrays(title: "应用", items: [PickerItems(id: 1, name: "Swift"), PickerItems(id: 2, name: "ObjC"), PickerItems(id: 3, name: "Swift/ObjC"), PickerItems(id: 5, name: "Swift/C++")]), PickerArrays(title: "二进制", items: [PickerItems(id: 4, name: "C")])], type: $type)
                 }
                 .background(BackgroundClearView())
                 .edgesIgnoringSafeArea([.bottom])
@@ -85,7 +94,7 @@ struct Home: View {
     }
 
     private var changelogSection: some View {
-        Section(header: Text("Changelog")) {
+        Section(header: Text("更新日志")) {
             VStack {
                 Spacer().frame(height: 10)
                 ScrollView {
@@ -108,12 +117,17 @@ struct Home: View {
                 BundleID = ""
                 showProj = true
             }) {
-                listItem(label: "Create Project", systemImageName: "+", text: "Creates a FCM Project")
+                listItem(label: "新建工程", systemImageName: "+", text: "创建一个 FCM 工程")
             }
             Button(action: {
                 fileImporter = true
             }) {
-                listItem(label: "Import Project", systemImageName: "↑", text: "Imports a FCM Project")
+                listItem(label: "导入工程", systemImageName: "↑", text: "导入一个已有的 FCM 工程（.sproj）")
+            }
+            Button(action: {
+                zipImporter = true
+            }) {
+                listItem(label: "从 ZIP 导入", systemImageName: "⇩", text: "从 zip 源码包导入工程")
             }
         }
     }
@@ -123,7 +137,7 @@ struct Home: View {
             hello = UUID()
             about = true
         }) {
-            listItem(label: "About", systemImageName: "i", text: "Shows Information about this App")
+            listItem(label: "关于", systemImageName: "i", text: "查看本应用的相关信息")
         }
         .sheet(isPresented: $about) {
             Frida(hello: $hello)
@@ -148,6 +162,41 @@ struct Home: View {
                     .frame(width: 20, height: 20)
                     .font(Font.custom("Menlo", size: 16).bold())
             }
+        }
+    }
+
+    private var importingOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.25).ignoresSafeArea()
+            VStack(spacing: 12) {
+                ProgressView()
+                Text("正在导入…").font(.footnote)
+            }
+            .padding(24)
+            .background(Color(.systemBackground))
+            .cornerRadius(14)
+        }
+    }
+
+    private func handleZipImport(result: Result<[URL], Error>) -> Void {
+        switch result {
+        case .success(let urls):
+            guard let fileURL = urls.first else { return }
+            importing = true
+            DispatchQueue.global(qos: .userInitiated).async {
+                let scope = fileURL.startAccessingSecurityScopedResource()
+                let outcome = importProjectArchive(target: fileURL.path)
+                if scope { fileURL.stopAccessingSecurityScopedResource() }
+                DispatchQueue.main.async {
+                    importing = false
+                    haptfeedback(outcome.ok ? 1 : 2)
+                    showAlert(with: outcome.message)
+                    hellnah = UUID()
+                }
+            }
+        case .failure(let error):
+            importing = false
+            showAlert(with: "导入失败：\(error.localizedDescription)")
         }
     }
 

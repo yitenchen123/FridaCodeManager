@@ -43,39 +43,39 @@ struct Settings: View {
     var body: some View {
         NavigationView {
             List {
-                Section(header: Text("default sdk")) {
+                Section(header: Text("默认 SDK")) {
                     NavigationLink(destination: SDKList(directoryPath: URL(fileURLWithPath: global_sdkpath) ,sdk: $sdk, isActive: $isActive), isActive: $isActive) {
                         Text(sdk)
                     }
                 }
-                Section(header: Text("Advanced")) {
+                Section(header: Text("高级")) {
                     NavigationLink(destination: NeoEditorSettings()) {
-                        Label("Code Editor", systemImage: "doc.plaintext.fill")
+                        Label("代码编辑器", systemImage: "doc.plaintext.fill")
                     }
                     NavigationLink(destination: SpacingSettingsBundle()) {
-                        Label("Spacing", systemImage: "text.word.spacing")
+                        Label("缩进", systemImage: "text.word.spacing")
                     }
                     NavigationLink(destination: AuthorSettings()) {
-                        Label("Author", systemImage: "person.fill")
+                        Label("作者", systemImage: "person.fill")
                     }
                 }
-                Section(header: Text("Additional Tools")) {
+                Section(header: Text("附加工具")) {
                     NavigationLink(destination: SDKDownload()) {
-                        Label("SDK Hub", systemImage: "arrow.down")
+                        Label("SDK 中心", systemImage: "arrow.down")
                     }
                     NavigationLink(destination: SFSymbolView()) {
-                        Label("SFSymbols", systemImage: "square.grid.3x3.fill")
+                        Label("SF 符号", systemImage: "square.grid.3x3.fill")
                     }
                     NavigationLink(destination: Cleaner()) {
-                        Label("Cleaner", systemImage: "trash.fill")
+                        Label("清理工具", systemImage: "trash.fill")
                     }
                 }
                 NavigationLink(destination: ExperimentalSettingsBundle()) {
-                    Label("Experimental", systemImage: "exclamationmark.triangle.fill")
+                    Label("实验性功能", systemImage: "exclamationmark.triangle.fill")
                 }
             }
             .listStyle(InsetGroupedListStyle())
-            .navigationTitle("Settings")
+            .navigationTitle("设置")
             .navigationBarTitleDisplayMode(.inline)
         }
         .navigationViewStyle(.stack)
@@ -83,12 +83,12 @@ struct Settings: View {
 }
 
 struct AuthorSettings: View {
-    @AppStorage("Author") var author: String = "Anonym"
+    @AppStorage("作者") var author: String = "Anonym"
     var body: some View {
         List {
-            TextField("Your Name", text: $author)
+            TextField("你的名字", text: $author)
         }
-        .navigationTitle("Author")
+        .navigationTitle("作者")
         .navigationBarTitleDisplayMode(.inline)
     }
 }

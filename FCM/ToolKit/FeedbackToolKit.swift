@@ -59,7 +59,7 @@ func showAlert(with message: String) {
     let alert = UIAlertController(title: "", message: message, preferredStyle: .alert)
 
     // Create the OK action
-    let okAction = UIAlertAction(title: "Close", style: .default, handler: nil)
+    let okAction = UIAlertAction(title: "关闭", style: .default, handler: nil)
 
     // Add the action to the alert
     alert.addAction(okAction)

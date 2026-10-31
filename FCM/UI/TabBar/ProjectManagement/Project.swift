@@ -102,7 +102,7 @@ func MakeApplicationProject(_ Name: String, _ BundleID: String, type: Int) -> In
             "SDK": SDK,
             "TYPE": TYPE,
             "CMacro": "stable",
-            "Macro": [
+            "宏": [
                 "stable": [:],
                 "debug": [:],
             ]
@@ -165,7 +165,7 @@ func MakeApplicationProject(_ Name: String, _ BundleID: String, type: Int) -> In
 }
 
 func authorgen(file: String) -> String {
-    let author = UserDefaults.standard.string(forKey: "Author")
+    let author = UserDefaults.standard.string(forKey: "作者")
     let dateFormatter = DateFormatter()
     dateFormatter.dateFormat = "dd.MM.yy"
     let currentDate = Date()

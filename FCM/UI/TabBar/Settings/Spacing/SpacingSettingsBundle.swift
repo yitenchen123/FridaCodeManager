@@ -7,10 +7,10 @@ struct SpacingSettingsBundle: View {
 
     var body: some View {
         List {
-            Section(header: Text("Mode")) {
+            Section(header: Text("模式")) {
                 Picker("", selection: $mode) {
-                    Text("tab").tag(0)
-                    Text("spaces").tag(1)
+                    Text("制表符（Tab）").tag(0)
+                    Text("空格").tag(1)
                 }
                 .pickerStyle(SegmentedPickerStyle())
             }
@@ -18,7 +18,7 @@ struct SpacingSettingsBundle: View {
                 Stepper("Spaces: \(spacing)", value: $spacing, in: 2...8)
             }
         }
-        .navigationTitle("Spacing")
+        .navigationTitle("缩进")
         .navigationBarTitleDisplayMode(.inline)
     }
 }

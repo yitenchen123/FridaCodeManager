@@ -82,7 +82,7 @@ struct ImgView: View {
     @State var imageloaded: Bool = false
     @Binding var iconid: UUID
     var body: some View {
-        Section(header: Text("icon")) {
+        Section(header: Text("图标")) {
             if let image = selectedImage {
                 HStack {
                     Spacer()
@@ -93,14 +93,14 @@ struct ImgView: View {
                         .cornerRadius(25)
                     Spacer()
                 }
-                Button("Assign Icon") {
+                Button("应用图标") {
                     saveImage(image)
                     iconid = UUID()
                 }
             } else {
-                Text("App does not have a Icon")
+                Text("应用还没有图标")
             }
-            Button("Add Icon") {
+            Button("添加图标") {
                 imageloaded = true
                 self.isImagePickerPresented.toggle()
             }
@@ -110,7 +110,7 @@ struct ImgView: View {
         }
         if FileManager.default.fileExists(atPath: "\(projpath)/Resources/AppIcon.png") {
             Section {
-                Button("Remove Icon") {
+                Button("移除图标") {
                     remove()
                     iconid = UUID()
                 }

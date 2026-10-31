@@ -93,7 +93,7 @@ struct NeoLog: View {
                         }
                     }
                     .contextMenu {
-                        Button("Copy") {
+                        Button("复制") {
                             copyToClipboard(text: getLogText(from: logsys.log))
                         }
                     }
@@ -109,15 +109,15 @@ struct NeoLog: View {
                     LogViews = tmpcache
                 }
             }
-            .navigationTitle("Log")
+            .navigationTitle("日志")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Menu {
-                        Button("Log") {
+                        Button("日志") {
                             type = 1
                         }
-                        Button("Issue Navigator") {
+                        Button("问题导航器") {
                             type = 0
                         }
                     } label: {
@@ -127,7 +127,7 @@ struct NeoLog: View {
                     }
                 }
                 ToolbarItem(placement: .navigationBarLeading) {
-                    Button("Close") {
+                    Button("关闭") {
                         UIInit(type: 0)
                         buildv = false
                         errorcache = LogViews

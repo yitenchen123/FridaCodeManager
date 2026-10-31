@@ -13,22 +13,22 @@ class MacroManager {
     }
     
     func getAllMacros() -> [String] {
-        guard let macroDict = plistData["Macro"] as? [String: Any] else {
+        guard let macroDict = plistData["宏"] as? [String: Any] else {
             return []
         }
         return Array(macroDict.keys)
     }
     
     func addMacro(_ macroName: String) {
-        var macroDict = plistData["Macro"] as? [String: Any] ?? [:]
+        var macroDict = plistData["宏"] as? [String: Any] ?? [:]
         macroDict[macroName] = [:]
-        plistData["Macro"] = macroDict
+        plistData["宏"] = macroDict
     }
 
     func removeMacro(_ macroName: String) {
-        var macroDict = plistData["Macro"] as? [String: Any] ?? [:]
+        var macroDict = plistData["宏"] as? [String: Any] ?? [:]
         macroDict.removeValue(forKey: macroName)
-        plistData["Macro"] = macroDict
+        plistData["宏"] = macroDict
     }
     
     func loadPlist() {

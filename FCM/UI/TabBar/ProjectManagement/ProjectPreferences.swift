@@ -38,10 +38,10 @@ struct ProjPreferences: View {
         NavigationView {
             List {
                 NavigationLink(destination: PrefsInfo(ProjectName: $ProjectName, hello: $hello)) {
-                    Label("App Information", systemImage: "list.bullet.rectangle.fill")
+                    Label("应用信息", systemImage: "list.bullet.rectangle.fill")
                 }
                 NavigationLink(destination: Appeareance(projname: ProjectName, projpath: "\(global_documents)/\(ProjectName)", iconid: $hello)) {
-                    Label("Appearance", systemImage: "paintbrush.fill")
+                    Label("外观", systemImage: "paintbrush.fill")
                 }
                 NavigationLink(destination: asksdk(projpath: "\(global_documents)/\(ProjectName)")) {
                     Label("SDK", systemImage: "sdcard.fill")
@@ -67,32 +67,32 @@ struct PrefsInfo: View {
     @State var rfresh: UUID = UUID()
     var body: some View {
         List {
-            Section(header: Text("Application Name")) {
-                TextField("Application Name", text: $AppliName)
+            Section(header: Text("应用名称")) {
+                TextField("应用名称", text: $AppliName)
                     .onSubmit {
                         save()
                     }
                 }
-                Section(header: Text("Display Name")) {
-                TextField("Display Name", text: $AppName)
+                Section(header: Text("显示名称")) {
+                TextField("显示名称", text: $AppName)
                     .onSubmit {
                         save()
                     }
                 }
-                Section(header: Text("BundleID")) {
-                TextField("BundleID", text: $BundleID)
+                Section(header: Text("包标识符（Bundle ID）")) {
+                TextField("包标识符（Bundle ID）", text: $BundleID)
                     .onSubmit {
                         save()
                     }
                 }
-                Section(header: Text("Version")) {
-                TextField("Version", text: $Version)
+                Section(header: Text("版本")) {
+                TextField("版本", text: $Version)
                     .onSubmit {
                         save()
                     }
                 }
-                Section(header: Text("Minimum Deployment Target")) {
-                TextField("Minimum Deployment Target", text: $MIOS)
+                Section(header: Text("最低部署版本")) {
+                TextField("最低部署版本", text: $MIOS)
                     .onSubmit {
                         save()
                     }
@@ -105,7 +105,7 @@ struct PrefsInfo: View {
             rfresh = UUID()
         }
         .listStyle(InsetGroupedListStyle())
-        .navigationTitle("App Information")
+        .navigationTitle("应用信息")
         .navigationBarTitleDisplayMode(.inline)
     }
 
@@ -132,12 +132,12 @@ struct Appeareance: View {
         List {
             ImgView(projpath: projpath,iconid: $iconid)
                 .id(iconid)
-            Section(header: Text("Orientation")) {
-                Toggle("Restrict Orientation", isOn: $restrict)
+            Section(header: Text("屏幕方向")) {
+                Toggle("限制屏幕方向", isOn: $restrict)
                     .tint(.orange)
                 if restrict == true {
-                    Toggle("Portrait Mode", isOn: $potrait)
-                    Toggle("Landscape Mode", isOn: $landscape)
+                    Toggle("竖屏", isOn: $potrait)
+                    Toggle("横屏", isOn: $landscape)
                 }
              }
          }
@@ -154,7 +154,7 @@ struct Appeareance: View {
          .onChange(of: landscape) { _ in
              update()
          }
-         .navigationTitle("Appeareance")
+         .navigationTitle("外观")
          .navigationBarTitleDisplayMode(.inline)
     }
 
@@ -216,7 +216,7 @@ struct asksdk: View {
         List {
             Text("\(sdk)")
             NavigationLink(destination: SDKList(directoryPath: URL(fileURLWithPath: global_sdkpath) ,sdk: $sdk, isActive: $isActive), isActive: $isActive) {
-                Text("Change")
+                Text("更改")
             }
         }
         .onChange(of: sdk) { _ in

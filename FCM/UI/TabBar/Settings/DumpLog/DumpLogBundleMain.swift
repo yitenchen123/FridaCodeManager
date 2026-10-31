@@ -3,13 +3,13 @@ import SwiftUI
 struct DumpLogBundleMain: View {
     var body: some View {
         List {
-            Button("Dump Log") {
+            Button("导出日志") {
                 mainlogSystem.dumpLog()
             }
-            Button("Clear Log") {
+            Button("清空日志") {
                 mainlogSystem.clearLog()
             }
-            Button("Test Print") {
+            Button("测试输出") {
                 print("meow meow")
             }
         }
