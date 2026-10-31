@@ -70,7 +70,8 @@ package_fs:
 		'Version: $(VERSION)' \
 		'Architecture: $(ARCH)' \
 		'Description: 类 Xcode 的 iOS 端开发 IDE（简体中文汉化版）' \
-		'Depends: swift, clang-14, ldid, git' \
+		'Depends: clang-14, ldid, git' \
+		'Recommends: swift' \
 		'Icon: https://raw.githubusercontent.com/fridakitten/FridaCodeManager/main/Blueprint/FridaCodeManager.app/AppIcon.png' \
 		'Conflicts: com.sparklechan.sparkkit' \
 		'Maintainer: FCCT' \
