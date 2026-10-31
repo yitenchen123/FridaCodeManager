@@ -101,15 +101,18 @@ jobs:
       - name: 补充构建工具（uuid 命令）
         run: |
           set -eux
-          # Essentials/libfcm/Makefile 用 `uuid` 生成目标文件名，越狱设备自带该命令，macOS 没有
+          # Essentials/libfcm/Makefile 用 uuid 给 .o 命名，越狱设备自带，macOS 没有
           if ! command -v uuid >/dev/null 2>&1; then
-            # 放进临时 bin 目录，避免污染系统路径
             mkdir -p "$RUNNER_TEMP/bin"
-            printf '#!/bin/sh\nexec uuidgen\n' > "$RUNNER_TEMP/bin/uuid"
+            cat > "$RUNNER_TEMP/bin/uuid" <<'EOS'
+          #!/bin/sh
+          exec uuidgen
+          EOS
             chmod +x "$RUNNER_TEMP/bin/uuid"
+            export PATH="$RUNNER_TEMP/bin:$PATH"
             echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           fi
-          command -v uuid || true
+          command -v uuid
           uuid
 
       - name: 构建 deb
