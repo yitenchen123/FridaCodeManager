@@ -101,11 +101,13 @@ jobs:
       - name: 构建 deb
         run: |
           set -eux
-          # 上游 Makefile 里 SHELL 写死 /var/jb/bin/sh 或 /bin/sh，macOS 上走 /bin/sh 分支
+          # Essentials/Makefile 把 SHELL 写死成 /var/jb/bin/bash（只在越狱设备上存在），
+          # macOS runner 上用命令行变量覆盖掉；顶层 Makefile 会自动选择 /bin/sh。
+          MKSHELL=/bin/bash
           if [ "$JB" = "roothide" ]; then
-            make roothide
+            make roothide SHELL="$MKSHELL"
           else
-            make all
+            make all SHELL="$MKSHELL"
           fi
 
       - name: 校验产物
