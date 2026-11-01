@@ -71,6 +71,11 @@ struct ProjectView: View {
                                         }) {
                                             Label("导出工程", systemImage: "archivebox")
                                         }
+                                        Button(action: {
+                                            generate_xcodeproj(Project)
+                                        }) {
+                                            Label("生成 Xcode 工程", systemImage: "hammer")
+                                        }
                                     }
                                     Button(action: {
                                         projname = Project.Name
@@ -128,6 +133,41 @@ struct ProjectView: View {
                     }
                 }
             } else { DismissAlert() }
+        }
+    }
+
+    /// 在工程目录里生成 .xcodeproj，方便拷到 Mac 上直接用 Xcode 打开
+    private func generate_xcodeproj(_ Project: Project) -> Void {
+        DispatchQueue.global(qos: .utility).async {
+            ShowAlert(UIAlertController(title: "正在生成 Xcode 工程…", message: "", preferredStyle: .alert))
+
+            let deps = loadProjectDependencies(projectPath: Project.ProjectPath)
+            let frameworks = deps.systemFrameworks.map { XcodeFrameworkRef(name: $0, path: "System/Library/Frameworks/\($0).framework", isSystem: true) }
+                + deps.localFrameworks.map { XcodeFrameworkRef(name: $0, path: $0, isSystem: false) }
+
+            var spec = buildProjectSpec(projectName: Project.Executable,
+                                        projectPath: Project.ProjectPath,
+                                        bundleIdentifier: Project.BundleID,
+                                        deploymentTarget: Project.TG)
+            spec.frameworks = frameworks
+            spec.headerSearchPaths = deps.headerSearchPaths
+            spec.otherLDFlags = deps.otherLDFlags
+            spec.preprocessorDefinitions = [Project.Macro]
+            spec.enableARC = true
+            spec.infoPlistPath = "\(Project.ProjectPath)/Resources/Info.plist"
+
+            let (ok, path) = writeXcodeProject(spec, projectPath: Project.ProjectPath)
+
+            DispatchQueue.main.async {
+                DismissAlert {
+                    haptfeedback(ok ? 1 : 2)
+                    if ok {
+                        showAlert(with: "已生成 \(Project.Executable).xcodeproj\n\n位置：\(path)\n\n源文件 \(spec.sources.count) 个，资源 \(spec.resources.count) 个。\n拷到 Mac 上可直接用 Xcode 打开。")
+                    } else {
+                        showAlert(with: "生成失败")
+                    }
+                }
+            }
         }
     }
 

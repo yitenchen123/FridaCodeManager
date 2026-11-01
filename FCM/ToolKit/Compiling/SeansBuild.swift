@@ -214,7 +214,15 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         localFrameworkFlags += " -F'" + fwDir + "' -framework " + item.name
     }
 
-    let frameflags = (frameworks.map { "-framework \($0)" }.joined(separator: " ") + localFrameworkFlags)
+    // Xcode 工程里的 OTHER_LDFLAGS 直接透传：
+    // 例如 "-Wl,-U,_terracotta_ios_start" 表示允许该符号未定义（运行时解析），
+    // 以及 -L<path> -lmbedtls 这类库搜索与链接参数。
+    let xcodeLinkFlags = clangLinkFlags(from: xcodeConfig)
+    let defineFlags = clangDefineFlags(from: xcodeConfig)
+
+    let frameflags = (frameworks.map { "-framework \($0)" }.joined(separator: " ")
+                    + localFrameworkFlags
+                    + xcodeLinkFlags)
 
     //setting up command
     messenger(status,progress,"setting up compiler",0.2)
@@ -231,16 +239,32 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         // 依赖下载完可能新增了头文件目录，重新扫描
     }
 
-    // 扫描工程内的头文件目录。Xcode 工程用 HEADER_SEARCH_PATHS 指定这些路径，
-    // FCM 之前完全不知道，导致 #import <mbedtls/xxx.h> 这类写法必然找不到。
-    let headerFlags = discoverHeaderPaths(ProjectInfo.ProjectPath)
+    // 优先读取 .xcodeproj 里的真实构建设置。
+    // Xcode 用 HEADER_SEARCH_PATHS / OTHER_LDFLAGS 精确控制编译，
+    // 靠扫描目录猜测必然对不上，这是之前链路反复失败的根因。
+    let xcodeConfig = loadXcodeBuildConfig(projectPath: ProjectInfo.ProjectPath)
+    var headerFlags = ""
+    if xcodeConfig.sourceFound && !xcodeConfig.headerSearchPaths.isEmpty {
+        headerFlags = clangIncludeFlags(from: xcodeConfig)
+        var report = "读取 Xcode 工程配置：头文件路径 \(xcodeConfig.headerSearchPaths.count) 个"
+        report += "，链接参数 \(xcodeConfig.otherLDFlags.count) 条"
+        _ = climessenger("xcode-config", report)
+        for path in xcodeConfig.headerSearchPaths.prefix(10) {
+            _ = climessenger("xcode-config", "  -I " + path.replacingOccurrences(of: ProjectInfo.ProjectPath + "/", with: ""))
+        }
+    } else {
+        // 没有工程配置时退回目录扫描
+        headerFlags = discoverHeaderPaths(ProjectInfo.ProjectPath)
+        _ = climessenger("xcode-config", "未找到 .xcodeproj 配置，改用目录扫描")
+    }
 
     // 现代 Objective-C 基本都用 ARC；不开 ARC 时任何 __weak 都会直接报错
     // （cannot create __weak reference in file using manual reference counting）。
     // 如需关闭，在工程的 api.api 里写 <noarc>true</noarc>。
-    var objcFlags = " -fobjc-arc -fobjc-link-runtime" + headerFlags
-    if apiextension.noarc {
-        objcFlags = ""
+    var objcFlags = " -fobjc-arc -fobjc-link-runtime" + headerFlags + defineFlags
+    // Xcode 工程里显式关闭 ARC 时以工程配置为准
+    if !xcodeConfig.enableObjCARC || apiextension.noarc {
+        objcFlags = " -fno-objc-arc"
     }
 
     // 双引号常量：直接写转义引号在多层的 Swift 字符串里极易出错，统一用 Q
