@@ -192,7 +192,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
 
     //finding code files
     messenger(status,progress,"finding code files",0.1)
-    let (MFiles, AFiles, SwiftFiles) = (FindFilesStack(ProjectInfo.ProjectPath, [".m", ".c", ".mm", ".cpp"], splitAndTrim(apiextension.ign) + ["Resources"]), FindFilesStack(ProjectInfo.ProjectPath, [".a"], splitAndTrim(apiextension.ign) + ["Resources"]), FindFilesStack(ProjectInfo.ProjectPath, [".swift"], splitAndTrim(apiextension.ign) + ["Resources"]))
+    let (MFiles, AFiles, SwiftFiles) = (FindFilesStack(ProjectInfo.ProjectPath, [".m", ".c", ".mm", ".cpp"], splitAndTrim(apiextension.ign) + ["Resources"]), collectIOSStaticLibraries(projectPath: ProjectInfo.ProjectPath, ignorePrefixes: splitAndTrim(apiextension.ign) + ["Resources"]), FindFilesStack(ProjectInfo.ProjectPath, [".swift"], splitAndTrim(apiextension.ign) + ["Resources"]))
 
     //finding frameworks
     messenger(status,progress,"finding frameworks", 0.15)
@@ -341,6 +341,19 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         cfolder(atPath: "\(global_container)/.cache/.\(ProjectInfo.SDK)")
     }
     #endif
+
+    // 静态库清单：工程里常有多平台预编译库，
+    // 链错平台会报 "building for iOS, but linking in object file built for macOS"
+    if !AFiles.isEmpty {
+        var libReport = "待链接静态库 \(AFiles.count) 个："
+        for lib in AFiles.prefix(12) {
+            libReport += "\n  " + lib
+        }
+        if AFiles.count > 12 { libReport += "\n  …" }
+        _ = climessenger("static-libs", libReport)
+    } else {
+        _ = climessenger("static-libs", "工程内没有可用的 iOS 静态库")
+    }
 
     // ---------------- 编译 ----------------
     messenger(status, progress, BuildStage.compile.display, 0.3)
