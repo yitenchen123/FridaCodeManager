@@ -33,7 +33,12 @@ import SwiftUI
 import Darwin
 
 /// 扫描工程内的头文件搜索路径
-/// 规则：目录名是 include / Headers / include* 的，或其父目录是 mbedtls / openssl 这类标准布局
+/// Xcode 用 HEADER_SEARCH_PATHS 指定这些目录，FCM 之前完全没有传，
+/// 导致 #import "a2_log.h"（在别的目录）和 #include <jni.h> 必然找不到。
+///
+/// 判定规则（任一满足即加入 -I）：
+///   1. 目录名是 include / includes / Headers / Public / include_debug
+///   2. 目录里直接存在 .h 文件（业务目录，例如 Natives/Support 同时放 .m 和 .h）
 func discoverHeaderPaths(_ projectPath: String) -> String {
     let fm = FileManager.default
     var paths: [String] = [projectPath]
@@ -42,27 +47,36 @@ func discoverHeaderPaths(_ projectPath: String) -> String {
     var count = 0
     for case let item as String in en {
         count += 1
-        if count > 20000 { break }
+        if count > 30000 { break }
+
         var isDir: ObjCBool = false
         let full = "\(projectPath)/\(item)"
         guard fm.fileExists(atPath: full, isDirectory: &isDir), isDir.boolValue else { continue }
 
         let name = (item as NSString).lastPathComponent
-        // 跳过构建产物与 VCS 目录
+        // 跳过构建产物、版本控制、以及明显与源码无关的目录
         if name == ".git" || name == "build" || name == "Payload" || name == "clang" ||
-           name == "node_modules" || name.hasPrefix(".") {
+           name == "node_modules" || name.hasPrefix(".") ||
+           name == "DerivedData" || name == "java_runtimes" || name == "depends" {
             en.skipDescendants()
             continue
         }
+
         let lower = name.lowercased()
-        // 常见头文件目录
         if lower == "include" || lower == "includes" || lower == "headers" ||
            lower == "include_debug" || lower == "public" {
+            paths.append(full)
+            continue
+        }
+
+        // 目录里直接含 .h 文件的，也当作头文件目录
+        let children = (try? fm.contentsOfDirectory(atPath: full)) ?? []
+        if children.contains(where: { $0.hasSuffix(".h") }) {
             paths.append(full)
         }
     }
 
-    // 去重并生成 -I 参数（加引号，路径可能含空格）
+    // 去重并生成 -I 参数（路径可能含空格，用单引号包住）
     var seen = Set<String>()
     var flags = ""
     for path in paths where !seen.contains(path) {
@@ -70,49 +84,6 @@ func discoverHeaderPaths(_ projectPath: String) -> String {
         flags += " -I'\(path)'"
     }
     return flags
-}
-
-/// 找出本机真正可用的 SDK 名
-/// 优先：工程指定的（若已安装）→ 同主版本最高的 → 设置里的默认 → 任意一个已安装的
-func resolveAvailableSDK(_ requested: String) -> String {
-    let fm = FileManager.default
-    let installed = ((try? fm.contentsOfDirectory(atPath: global_sdkpath)) ?? [])
-        .filter { $0.hasPrefix("iPhoneOS") && $0.hasSuffix(".sdk") }
-
-    if installed.isEmpty { return requested }
-    if installed.contains(requested) { return requested }
-
-    // 同主版本（例如 16.5 找不到时，用 16.x）
-    let wantedMajor = requested
-        .replacingOccurrences(of: "iPhoneOS", with: "")
-        .replacingOccurrences(of: ".sdk", with: "")
-        .split(separator: ".").first.map(String.init)
-
-    if let major = wantedMajor {
-        let sameMajor = installed.filter {
-            $0.replacingOccurrences(of: "iPhoneOS", with: "")
-                .replacingOccurrences(of: ".sdk", with: "")
-                .hasPrefix(major + ".")
-        }
-        if let best = sameMajor.sorted(by: { versionKey($0) < versionKey($1) }).last {
-            print("SDK \"\(requested)\" 未安装，自动使用 \"\(best)\"")
-            return best
-        }
-    }
-
-    // 设置里的默认 SDK
-    let fallback = UserDefaults.standard.string(forKey: "sdk") ?? ""
-    if installed.contains(fallback) {
-        print("SDK \"\(requested)\" 未安装，自动使用默认 \"\(fallback)\"")
-        return fallback
-    }
-
-    // 任意一个最简单的
-    if let any = installed.sorted(by: { versionKey($0) < versionKey($1) }).last {
-        print("SDK \"\(requested)\" 未安装，自动使用 \"\(any)\"")
-        return any
-    }
-    return requested
 }
 
 /// 把 iPhoneOS16.4.sdk 转成可直接比较的字符串（各段补零到 3 位，字典序 == 版本序）
