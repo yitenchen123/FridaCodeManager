@@ -35,6 +35,11 @@ struct Home: View {
     @State private var fileImporter = false
     @State private var zipImporter = false
     @State private var importing = false
+    @State private var showGitHub = false
+    @State private var repoURL = ""
+    @State private var repoToken = ""
+    @State private var useToken = false
+    @State private var importStatus = ""
     @State private var showProj = false
     @State private var about = false
     @State private var hello = UUID()
@@ -67,6 +72,20 @@ struct Home: View {
                 if importing {
                     importingOverlay
                 }
+            }
+            .sheet(isPresented: $showGitHub) {
+                BottomPopupView {
+                    POHeader(title: "从 GitHub 导入")
+                    POTextField(title: "仓库地址", content: $repoURL)
+                    POPicker(function: {}, title: "私有仓库", arrays: [PickerArrays(title: "认证", items: [PickerItems(id: 0, name: "公开仓库"), PickerItems(id: 1, name: "使用 Token")])], type: useTokenInt)
+                    if useToken {
+                        POTextField(title: "访问 Token", content: $repoToken)
+                    }
+                    Spacer().frame(height: 8)
+                    POButtonBar(cancel: { showGitHub = false }, confirm: github_trigger)
+                }
+                .background(BackgroundClearView())
+                .edgesIgnoringSafeArea([.bottom])
             }
             .sheet(isPresented: $showProj) {
                 BottomPopupView {
@@ -129,6 +148,15 @@ struct Home: View {
             }) {
                 listItem(label: "从 ZIP 导入", systemImageName: "⇩", text: "从 zip 源码包导入工程")
             }
+            Button(action: {
+                if repoToken.isEmpty {
+                    repoToken = UserDefaults.standard.string(forKey: "GIT_TOKEN") ?? ""
+                }
+                useToken = !repoToken.isEmpty
+                showGitHub = true
+            }) {
+                listItem(label: "从 GitHub 导入", systemImageName: "⌥", text: "拉取 GitHub 仓库源码生成工程")
+            }
         }
     }
 
@@ -170,11 +198,46 @@ struct Home: View {
             Color.black.opacity(0.25).ignoresSafeArea()
             VStack(spacing: 12) {
                 ProgressView()
-                Text("正在导入…").font(.footnote)
+                Text(importStatus.isEmpty ? "正在导入…" : importStatus).font(.footnote)
             }
             .padding(24)
             .background(Color(.systemBackground))
             .cornerRadius(14)
+        }
+    }
+
+    private var useTokenInt: Binding<Int> {
+        Binding(
+            get: { useToken ? 1 : 0 },
+            set: { useToken = ($0 == 1) }
+        )
+    }
+
+    private func github_trigger() -> Void {
+        let repo = repoURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !repo.isEmpty else {
+            haptfeedback(2)
+            return
+        }
+        if useToken && !repoToken.isEmpty {
+            UserDefaults.standard.set(repoToken, forKey: "GIT_TOKEN")
+        }
+        showGitHub = false
+        importing = true
+        importStatus = "准备中…"
+        let tokenValue = useToken ? repoToken : nil
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let outcome = importGitHubRepo(repo, token: tokenValue) { step in
+                DispatchQueue.main.async { importStatus = step }
+            }
+            DispatchQueue.main.async {
+                importing = false
+                importStatus = ""
+                haptfeedback(outcome.ok ? 1 : 2)
+                showAlert(with: outcome.message)
+                hellnah = UUID()
+            }
         }
     }
 
