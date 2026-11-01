@@ -103,14 +103,19 @@ struct SDKDownload: View {
 
     // MARK: - 下载
 
-    /// 多镜像回退：raw.githubusercontent 在国内经常超时，优先 jsDelivr
+    /// 多镜像回退。raw.githubusercontent 在国内基本不通，优先用可用的镜像；
+    /// 并从用户自己的仓库（含本次改动）取包，避免上游分支变动导致 404。
     private func mirrorURLs(_ sdk: String) -> [String] {
         let path = "FCM/UI/TabBar/Settings/SDKHub/sdk/iOS\(sdk).zip"
-        return [
-            "https://cdn.jsdelivr.net/gh/fridakitten/FridaCodeManager@main/\(path)",
-            "https://fastly.jsdelivr.net/gh/fridakitten/FridaCodeManager@main/\(path)",
-            "https://raw.githubusercontent.com/fridakitten/FridaCodeManager/main/\(path)"
-        ]
+        let repo = "yitenchen123/FridaCodeManager"
+        let branch = "zh-cn"
+        var urls: [String] = []
+        // 顺序按实测可用性排列（国内网络）
+        urls.append("https://cdn.jsdelivr.net/gh/\(repo)@\(branch)/\(path)")
+        urls.append("https://fastly.jsdelivr.net/gh/\(repo)@\(branch)/\(path)")
+        urls.append("https://gh-proxy.com/https://raw.githubusercontent.com/\(repo)/\(branch)/\(path)")
+        urls.append("https://raw.githubusercontent.com/\(repo)/\(branch)/\(path)")
+        return urls
     }
 
     private func download(_ sdk: String) -> Void {
@@ -190,13 +195,14 @@ struct SDKDownload: View {
                 let staged = "\(global_container)/tmp/sdk-import-\(UUID())"
                 cfolder(atPath: staged)
                 var ok = libzip_unzip(fileURL.path, staged) == 0
-                // libzip 不认 tar.gz，扩展名是 tgz/tar.gz 时交给系统 tar
-                let lower = fileURL.lastPathComponent.lowercased()
-                if !ok && (lower.hasSuffix(".tgz") || lower.hasSuffix(".tar.gz") || lower.hasSuffix(".tar")) {
-                    #if !stock
-                    let code = shell("mkdir -p '\(staged)' && tar xzf '\(fileURL.path)' -C '\(staged)' 2>/dev/null", uid: 501, env: [])
-                    ok = (code == 0)
-                    #endif
+
+                // libzip 不认 tar 系列，用系统 tar 兜底（rootless 下 tar 在 /var/jb/usr/bin）
+                if !ok {
+                    ok = unarchiveTar(fileURL.path, to: staged)
+                }
+                if !ok {
+                    // 有些包换了后缀，直接嗅探文件头
+                    ok = looksLikeTarball(fileURL.path) && unarchiveTar(fileURL.path, to: staged)
                 }
                 if scope { fileURL.stopAccessingSecurityScopedResource() }
 
@@ -258,6 +264,47 @@ struct SDKDownload: View {
             if !results.isEmpty { break }
         }
         return results
+    }
+
+    /// 用系统 tar 解压（libzip 不支持 tar.gz / tgz）
+    private func unarchiveTar(_ path: String, to destination: String) -> Bool {
+        var candidates: [String] = []
+        #if jailbreak
+        candidates = ["/var/jb/usr/bin/tar", "/usr/bin/tar", "/var/jb/bin/tar"]
+        #else
+        candidates = ["/usr/bin/tar", "/var/jb/usr/bin/tar"]
+        #endif
+
+        let fm = FileManager.default
+        var tarPath: String? = nil
+        for candidate in candidates where fm.isExecutableFile(atPath: candidate) {
+            tarPath = candidate
+            break
+        }
+        guard let tar = tarPath else { return false }
+
+        let command = "mkdir -p '\(destination)' && '\(tar)' -xzf '\(path)' -C '\(destination)' 2>/dev/null"
+        // 先以普通用户身份解压，失败再提权（rootless 下 tar 可能属于 root）
+        if shell(command, uid: 501, env: []) == 0 { return true }
+        #if !stock
+        if shell(command, uid: 0, env: []) == 0 { return true }
+        #endif
+        // 可能是未压缩的 .tar
+        let plain = "mkdir -p '\(destination)' && '\(tar)' -xf '\(path)' -C '\(destination)' 2>/dev/null"
+        return shell(plain, uid: 501, env: []) == 0
+    }
+
+    /// 通过文件头判断是不是 tar / gzip
+    private func looksLikeTarball(_ path: String) -> Bool {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return false }
+        defer { handle.closeFile() }
+        let head = handle.readData(ofLength: 4)
+        guard head.count >= 2 else { return false }
+        let b = [UInt8](head)
+        if b[0] == 0x1F && b[1] == 0x8B { return true }   // gzip
+        if b[0] == 0x42 && b[1] == 0x5A { return true }   // bzip2
+        if b[0] == 0xFD && b[1] == 0x37 { return true }   // xz
+        return false
     }
 
     /// 读取 SDKSettings.plist 里的 Version

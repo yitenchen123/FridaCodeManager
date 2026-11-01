@@ -85,6 +85,7 @@ private func ghRequest(_ url: URL, token: String?) -> URLRequest {
 }
 
 /// 同步方式下载（在后台队列里调用），返回 (临时文件路径, HTTP 状态码, 错误信息)
+/// 下载到临时文件（在后台队列里同步等待），返回 (临时路径, HTTP 状态码, 错误)
 private func ghDownload(_ url: URL, token: String?) -> (String?, Int, String?) {
     let destination = "\(global_container)/tmp/gh-\(UUID()).zip"
     var resultPath: String? = nil
@@ -92,29 +93,38 @@ private func ghDownload(_ url: URL, token: String?) -> (String?, Int, String?) {
     var errorMessage: String? = nil
     let semaphore = DispatchSemaphore(value: 0)
 
-    let request = ghRequest(url, token: token)
-    let task = URLSession.shared.dataTask(with: request) { body, response, error in
+    var request = ghRequest(url, token: token)
+    request.setValue("application/zip", forHTTPHeaderField: "Accept")
+
+    // 用 downloadTask，避免把整个仓库读进内存（大仓库会 OOM）
+    let task = URLSession.shared.downloadTask(with: request) { location, response, error in
         defer { semaphore.signal() }
+        if let http = response as? HTTPURLResponse {
+            statusCode = http.statusCode
+        }
         if let error = error {
             errorMessage = error.localizedDescription
             return
         }
-        if let http = response as? HTTPURLResponse {
-            statusCode = http.statusCode
-        }
-        guard let body = body, !body.isEmpty else {
+        guard let location = location else {
             errorMessage = "服务器没有返回数据"
             return
         }
         do {
-            try body.write(to: URL(fileURLWithPath: destination))
+            if FileManager.default.fileExists(atPath: destination) {
+                try? FileManager.default.removeItem(atPath: destination)
+            }
+            try FileManager.default.moveItem(at: location, to: URL(fileURLWithPath: destination))
             resultPath = destination
         } catch {
             errorMessage = "写入临时文件失败"
         }
     }
     task.resume()
-    _ = semaphore.wait(timeout: .now() + 300)
+    if semaphore.wait(timeout: .now() + 300) == .timedOut {
+        task.cancel()
+        return (nil, -1, "下载超时（300 秒）")
+    }
     return (resultPath, statusCode, errorMessage)
 }
 

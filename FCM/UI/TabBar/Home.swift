@@ -82,7 +82,7 @@ struct Home: View {
                         POTextField(title: "访问 Token", content: $repoToken)
                     }
                     Spacer().frame(height: 8)
-                    POButtonBar(cancel: { showGitHub = false }, confirm: github_trigger)
+                    POButtonBar(cancel: { showGitHub = false }, confirm: { startGitHubImport() })
                 }
                 .background(BackgroundClearView())
                 .edgesIgnoringSafeArea([.bottom])
@@ -213,6 +213,21 @@ struct Home: View {
         )
     }
 
+    private func startGitHubImport() -> Void {
+        let repo = repoURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if repo.isEmpty {
+            haptfeedback(2)
+            showAlert(with: "请先填写仓库地址，例如：\nhttps://github.com/用户/仓库")
+            return
+        }
+        // sheet 关闭和 importing 同时置位会让 SwiftUI 只展示/只关闭其中一个，
+        // 表现为「点确认没反应」。先关弹窗，等动画结束再启动导入。
+        showGitHub = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+            github_trigger()
+        }
+    }
+
     private func github_trigger() -> Void {
         let repo = repoURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !repo.isEmpty else {
@@ -222,7 +237,6 @@ struct Home: View {
         if useToken && !repoToken.isEmpty {
             UserDefaults.standard.set(repoToken, forKey: "GIT_TOKEN")
         }
-        showGitHub = false
         importing = true
         importStatus = "准备中…"
         let tokenValue = useToken ? repoToken : nil
