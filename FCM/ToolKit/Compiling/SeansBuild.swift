@@ -115,12 +115,13 @@ func resolveAvailableSDK(_ requested: String) -> String {
     return requested
 }
 
-/// 把 iPhoneOS16.4.sdk 转成可比较的数字元组
-func versionKey(_ sdkName: String) -> [Int] {
+/// 把 iPhoneOS16.4.sdk 转成可直接比较的字符串（各段补零到 3 位，字典序 == 版本序）
+func versionKey(_ sdkName: String) -> String {
     let raw = sdkName
         .replacingOccurrences(of: "iPhoneOS", with: "")
         .replacingOccurrences(of: ".sdk", with: "")
-    return raw.split(separator: ".").map { Int($0) ?? 0 }
+    let parts = raw.split(separator: ".").map { Int($0) ?? 0 }
+    return parts.map { String(format: "%03d", $0) }.joined(separator: ".")
 }
 
 func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ progress: Binding<Double>?) -> Int {

@@ -16,7 +16,7 @@
  You should have received a copy of the GNU General Public License
  along with FridaCodeManager. If not, see <https://www.gnu.org/licenses/>.
 
- 从 .github/workflows/*.yml 读取 CI 配置，在构建前执行等价的准备步骤。
+ 从 .github/workflows 下的 yml 工作流读取 CI 配置，在构建前执行等价的准备步骤。
  典型用途：很多项目把依赖（mbedtls、JRE、预编译库）放在 CI 里现下，
  源码包里并不包含，直接编译必然缺头文件。
  */
@@ -145,6 +145,10 @@ private let kSkipPatterns: [String] = [
     "runs-on",
     "github.event",
     "${{ secrets.",
+    "macos-",          // runner 镜像名，设备上无意义
+    "ubuntu-",
+    "windows-",
+    "runs-on",
     "echo \"",             // 纯回显，无实际作用
     "zip -r", "mkpayload",  // 打包步骤由 FCM 自己做
     "install_name_tool",    // 依赖已打包好的产物
