@@ -217,7 +217,7 @@ func clangLinkFlags(from config: XcodeBuildConfig) -> String {
 func clangDefineFlags(from config: XcodeBuildConfig) -> String {
     var flags = ""
     for raw in config.preprocessorDefinitions {
-        var value = raw.trimmingCharacters(in: .whitespaces)
+        let value = raw.trimmingCharacters(in: .whitespaces)
         if value.isEmpty { continue }
         // DEBUG=1 这种直接透传
         flags += " -D" + shellQuote(value)

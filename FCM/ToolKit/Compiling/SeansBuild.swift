@@ -224,9 +224,6 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
                     + localFrameworkFlags
                     + xcodeLinkFlags)
 
-    //setting up command
-    messenger(status,progress,"setting up compiler",0.2)
-
     // 如果工程带 .github/workflows，优先执行其中的依赖准备步骤。
     // 很多项目的第三方库（mbedtls / JRE / 预编译 dylib）不进 git，
     // 而是在 CI 里现下，直接编译必然缺头文件。
@@ -238,6 +235,9 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         }
         // 依赖下载完可能新增了头文件目录，重新扫描
     }
+
+    //setting up command
+    messenger(status,progress,"setting up compiler",0.2)
 
     // 优先读取 .xcodeproj 里的真实构建设置。
     // Xcode 用 HEADER_SEARCH_PATHS / OTHER_LDFLAGS 精确控制编译，
