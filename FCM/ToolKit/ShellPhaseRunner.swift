@@ -151,6 +151,14 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
     let productsDir = appPath.isEmpty ? buildDir : (appPath as NSString).deletingLastPathComponent
     let targetBuildDir = productsDir
 
+    // 探测 JDK：很多工程（如 Air2）的 Makefile 用 BOOTJDK 指定编译器，
+    // 实际只要求 javac/jar 可用，字节码版本由 -source 8 -target 8 控制。
+    let java = detectJavaToolchain(projectPath: projectPath)
+    let javaReport = describeJavaToolchain(java)
+    for line in javaReport.split(separator: "\n") {
+        log("  JDK：" + line)
+    }
+
     // 安装 macOS 工具模拟层：java_home / actool / xcodebuild / codesign 等
     // 没有这层，工程脚本里的 macOS 专属命令会让 set -e 直接中止构建。
     let shimInstall = installPlatformShims(projectPath: projectPath)
@@ -187,6 +195,14 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
         body += "export PLATFORM_NAME=\"iphoneos\"\n"
         body += "export EFFECTIVE_PLATFORM_NAME=\"-iphoneos\"\n"
         body += "export TARGET_NAME=\"\((appPath as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: ""))\"\n"
+
+        // 把探测到的 JDK 传给脚本：Makefile 里的 BOOTJDK 与 JAVA_HOME 都会生效
+        if let home = java.home, java.ready {
+            body += "export JAVA_HOME=\"\(home)\"\n"
+            body += "export BOOTJDK=\"\(home)\"\n"
+            let binDir = "\(home)/bin"
+            body += "export PATH=\"" + binDir + ":$PATH\"\n"
+        }
         // shim 目录放最前，让 java_home / actool / codesign 等落到我们的实现
         body += "export PATH=\"" + shimInstall.dir + ":/var/jb/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"\n"
         body += "cd \"\(projectPath)\"\n"
