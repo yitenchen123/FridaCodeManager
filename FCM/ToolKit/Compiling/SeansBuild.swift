@@ -259,32 +259,54 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         #endif
     } else {
         #if jailbreak
-        // 纯 ObjC 工程：并行编译，单文件失败不中断。
-        // 并行编译：每个编译单元写成一行，交给 xargs -P 多进程执行，
-        // 与 Xcode 默认的并行编译一致。失败的文件名统一收集到 FAIL_LOG。
-        let compileUnits = MFiles.map { mFile in
-            [
-                "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) -c ",
-                quoted(ProjectInfo.ProjectPath, mFile),
-                " -o 'clang/", UUID().uuidString, ".o' 2>/dev/null || echo ",
-                Q, mFile, Q
-                ].joined()
+        // 纯 ObjC 工程：增量 + 并行编译。
+        // 只为「源码或编译参数变化」的文件生成编译单元，
+        // 其余直接复用已有 .o，二次构建可以快一个数量级。
+        let objectDir = "\(ProjectInfo.ProjectPath)/clang"
+        let token = flagsToken(macro: ProjectInfo.Macro,
+                               sdk: ProjectInfo.SDK,
+                               target: ProjectInfo.TG,
+                               headerFlags: headerFlags,
+                               extraFlags: objcFlags)
+        let plan = planCompilation(projectPath: ProjectInfo.ProjectPath,
+                                   sources: MFiles,
+                                   objectDir: objectDir,
+                                   flagsToken: token,
+                                   forceFull: false)
+
+        // 变更统计写进日志，方便判断增量是否生效
+        var planReport = "编译计划：\(MFiles.count) 个源文件，"
+        planReport += "需重编 \(plan.rebuilt) 个，复用 \(plan.reused) 个"
+        _ = climessenger("build-plan", planReport)
+
+        let pending = plan.units.filter { $0.needsRebuild }
+        if !pending.isEmpty {
+            let compileUnits = pending.map { unit in
+                [
+                    "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) -c ",
+                    quoted(ProjectInfo.ProjectPath, unit.source),
+                    " -o ", quoted(ProjectInfo.ProjectPath, "./clang/" + (unit.object as NSString).lastPathComponent),
+                    " 2>/dev/null || echo ", Q, unit.source, Q
+                    ].joined()
+            }
+            let unitsFile = "\(ProjectInfo.ProjectPath)/.fcm-units.txt"
+            cfile(atPath: unitsFile, withContent: compileUnits.joined(separator: "\n"))
+
+            var jobs = ProcessInfo.processInfo.activeProcessorCount
+            if jobs > 8 { jobs = 8 }
+            if jobs < 2 { jobs = 2 }
+            let runnerFile = "\(ProjectInfo.ProjectPath)/.fcm-run.sh"
+            cfile(atPath: runnerFile, withContent:
+                "#!/bin/sh\ncat '" + unitsFile + "' | xargs -P " + String(jobs) + " -I {} sh -c '{}'\n")
+
+            EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -f " + FAIL_LOG + " ; "
+            EXEC += "sh '" + runnerFile + "' >> " + FAIL_LOG + " 2>&1 ; "
+            EXEC += "rm -f '" + runnerFile + "' '" + unitsFile + "' ; "
+        } else {
+            EXEC += "rm -f " + FAIL_LOG + " ; "
         }
-        let unitsFile = "\(ProjectInfo.ProjectPath)/.fcm-units.txt"
-        cfile(atPath: unitsFile, withContent: compileUnits.joined(separator: "\n"))
-        EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -rf clang && mkdir -p clang ; rm -f " + FAIL_LOG + " ; "
-        // 并行执行脚本单独写成文件，避免在 Swift 字符串里拼 shell 变量
-        let runnerFile = "\(ProjectInfo.ProjectPath)/.fcm-run.sh"
-        // 并行度在 Swift 侧算好，脚本里不出现 shell 变量，避免 Swift 插值冲突
-        var jobs = ProcessInfo.processInfo.activeProcessorCount
-        if jobs > 8 { jobs = 8 }
-        if jobs < 2 { jobs = 2 }
-        let runnerScript = "#!/bin/sh\n"
-            + "cat '" + unitsFile + "' | xargs -P " + String(jobs) + " -I {} sh -c '{}'\n"
-        cfile(atPath: runnerFile, withContent: runnerScript)
-        EXEC += "sh '" + runnerFile + "' >> " + FAIL_LOG + " 2>&1 ; "
-        EXEC += "rm -f '" + runnerFile + "' ; "
-        EXEC += "rm -f '" + unitsFile + "' ; "
+
+        // 链接：收集所有 .o（含复用的）
         EXEC += "mkdir -p '" + info[1] + "' ; "
         EXEC += """
         clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, AFiles)) clang/*.o -o '\(info[1])/\(ProjectInfo.Executable)'
@@ -356,14 +378,28 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     _ = rm(stagingApp)
     cfolder(atPath: stagingApp)
 
-    do {
-        let contents = try FileManager.default.contentsOfDirectory(atPath: info[2])
-        for item in contents where item != "DontTouchMe.plist" && item != ".DS_Store" {
-            try FileManager.default.copyItem(atPath: "\(info[2])/\(item)",
-                                             toPath: "\(stagingApp)/\(item)")
-        }
-    } catch {
-        _ = climessenger("bundle-stage", "复制资源失败：\(error.localizedDescription)")
+    // 资源编译：storyboard/xib 交给 ibtool，xcassets 交给 actool，
+    // 同时补齐 Info.plist 必需键并生成 PkgInfo，尽量贴近 Xcode 的产出结构。
+    let resourceReport = compileResources(from: info[2],
+                                          into: stagingApp,
+                                          projectName: ProjectInfo.Executable,
+                                          executable: ProjectInfo.Executable,
+                                          sdkPath: info[3],
+                                          minimumOS: ProjectInfo.TG)
+
+    var bundleSummary = "资源：拷贝 \(resourceReport.copied) 项"
+    if resourceReport.storyboards > 0 { bundleSummary += "，界面 \(resourceReport.storyboards) 个" }
+    if resourceReport.assetCatalogs > 0 { bundleSummary += "，资源目录 \(resourceReport.assetCatalogs) 个" }
+    _ = climessenger("bundle-stage", bundleSummary)
+    for warning in resourceReport.warnings {
+        _ = climessenger("bundle-stage", "  提示：" + warning)
+    }
+
+    // 复制可执行文件（签名前需要它已在 .app 内）
+    let builtBinary = "\(info[1])/\(ProjectInfo.Executable)"
+    if !FileManager.default.fileExists(atPath: builtBinary) {
+        _ = climessenger("bundle-stage", "可执行文件缺失：\(builtBinary)")
+        _ = climessenger("bundle-hint", "链接阶段没有产出，请查看上面的编译日志")
         _ = rm(info[0])
         return 1
     }
