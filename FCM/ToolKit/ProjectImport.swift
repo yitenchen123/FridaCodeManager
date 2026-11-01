@@ -270,13 +270,13 @@ private func makeBundleID(for directory: String) -> String {
     return "com.imported.\(raw)"
 }
 
-/// 给普通源码包包一层工程外壳（当它是二进制类工程时用），返回新工程路径
+/// 把源码目录收编成一个工程：源码**平铺在工程根目录**，只额外生成 Resources/ 等配置
+/// 不再套 Source/ 这层目录，避免打开工程后只能看到一个 Source 文件夹
 private func wrapSourcesAsProject(_ directory: String, name: String) -> String? {
     let fm = FileManager.default
     let entries = (try? fm.contentsOfDirectory(atPath: directory)) ?? []
-    let hasEntitlements = entries.contains("entitlements.plist")
 
-    // 工程自身的配置不能被当成源码挪走
+    // 真工程（有 Resources 或 DontTouchMe.plist）不该走到这里
     if entries.contains("Resources") || entries.contains("DontTouchMe.plist") {
         return nil
     }
@@ -284,26 +284,101 @@ private func wrapSourcesAsProject(_ directory: String, name: String) -> String? 
     let wrapUUID = "\(UUID())"
     let wrapPath = "\(global_documents)/\(wrapUUID)"
     cfolder(atPath: wrapPath)
-    guard mv(directory, "\(wrapPath)/Source") == 0 else {
-        _ = rm(wrapPath)
-        return nil
+
+    // 逐项搬进工程根目录（同名的 plist 会跟自动生成冲突，先移开）
+    var hasEntitlements = false
+    for item in entries {
+        if item == ".DS_Store" || item == "__MACOSX" { continue }
+        let src = "\(directory)/\(item)"
+        if item == "entitlements.plist" {
+            hasEntitlements = true
+            _ = mv(src, "\(wrapPath)/entitlements.plist")
+            continue
+        }
+        if item == "Info.plist" || item == "DontTouchMe.plist" {
+            // 根目录下散落的旧 plist 放进 Resources，不要覆盖自动生成的
+            cfolder(atPath: "\(wrapPath)/Resources")
+            _ = mv(src, "\(wrapPath)/Resources/\(item)")
+            continue
+        }
+        _ = mv(src, "\(wrapPath)/\(item)")
     }
+
     repairProjectDirectory(wrapPath)
 
-    // 如果带了 entitlements.plist，用导入的
-    if hasEntitlements {
-        _ = cp("\(wrapPath)/Source/entitlements.plist", "\(wrapPath)/entitlements.plist")
+    if !hasEntitlements {
+        let ent: [String: Any] = ["platform-application": true]
+        if let data = try? PropertyListSerialization.data(fromPropertyList: ent, format: .xml, options: 0) {
+            fm.createFile(atPath: "\(wrapPath)/entitlements.plist", contents: data, attributes: nil)
+        }
     }
 
-    // 让可执行文件名跟随目录名
+    // 可执行文件名跟随导入的仓库/目录名
     let exec = name.replacingOccurrences(of: " ", with: "_")
+        .replacingOccurrences(of: "-", with: "_")
+        .replacingOccurrences(of: ".", with: "_")
     _ = wplist(value: exec, forKey: "CFBundleExecutable", plistPath: "\(wrapPath)/Resources/Info.plist")
     _ = wplist(value: name, forKey: "CFBundleName", plistPath: "\(wrapPath)/Resources/Info.plist")
     _ = wplist(value: makeBundleID(for: wrapPath), forKey: "CFBundleIdentifier", plistPath: "\(wrapPath)/Resources/Info.plist")
     return wrapPath
 }
 
-// MARK: - 主入口
+/// 普通源码包：根据结构决定是「造工程外壳」还是「直接放进当前目录」
+private func adoptSourceDirectory(_ source: String, fallbackName: String?) -> ImportOutcome {
+    let scan = scanSources(in: source)
+    if scan.files == 0 {
+        return .fail("压缩包里没有可识别的源码文件")
+    }
+
+    let name = fallbackName ?? ((source as NSString).lastPathComponent)
+
+    // 有嵌套源码目录（说明是完整 App 工程树），或者是 C 二进制工程，就造一个工程外壳
+    // 根目录下直接摊开的源码（如 main.c / main.m）按二进制工程处理
+    let rootFiles = (try? FileManager.default.contentsOfDirectory(atPath: source)) ?? []
+    let hasRootSource = rootFiles.contains { kSourceExtensions.contains(($0 as NSString).pathExtension.lowercased()) }
+    let needsWrap = hasRootSource || scan.maxDepth >= 2 || !FileManager.default.fileExists(atPath: "\(source)/Resources")
+    if needsWrap {
+        let wrapped = wrapSourcesAsProject(source, name: name)
+        guard let projectPath = wrapped else {
+            return .fail("创建工程外壳失败")
+        }
+        return .success("已导入工程「\(name)」", projectPath)
+    }
+    return .success("已导入 \(scan.files) 个源码文件", nil)
+}
+
+/// 把 repo-main / repo-master / repo-1.2.3 这类目录名还原成仓库名
+private func cleanRepoName(_ raw: String) -> String {
+    var name = raw
+    if name.hasSuffix(".zip") || name.hasSuffix(".sproj") {
+        name = (name as NSString).deletingPathExtension
+    }
+    for suffix in ["-main", "-master", "-develop", "-dev"] {
+        if name.hasSuffix(suffix) {
+            return String(name.dropLast(suffix.count))
+        }
+    }
+    // repo-<分支名>：只在后缀里有数字或点号时认为是版本/分支
+    if let dash = name.lastIndex(of: "-") {
+        let tail = String(name[name.index(after: dash)...])
+        if !tail.isEmpty && tail.allSatisfy({ $0.isNumber || $0 == "." || $0 == "v" }) {
+            return String(name[..<dash])
+        }
+    }
+    return name
+}
+
+/// 如果一个目录里只有一个子目录，且没有别的文件，返回这个子目录（用于剥掉 repo-main/ 这层）
+func singleSubdirectory(of directory: String) -> String? {
+    let fm = FileManager.default
+    guard let entries = try? fm.contentsOfDirectory(atPath: directory) else { return nil }
+    let visible = entries.filter { !kIgnoredNames.contains($0) && !$0.hasPrefix(".") }
+    guard visible.count == 1 else { return nil }
+    let candidate = "\(directory)/\(visible[0])"
+    var isDir: ObjCBool = false
+    guard fm.fileExists(atPath: candidate, isDirectory: &isDir), isDir.boolValue else { return nil }
+    return candidate
+}
 
 /// 从 .zip / .sproj 压缩包导入一个工程
 func importProjectArchive(target: String) -> ImportOutcome {
@@ -317,11 +392,10 @@ func importProjectArchive(target: String) -> ImportOutcome {
     cfolder(atPath: kImportStaging)
     _ = rm(staging)
 
-    // 解压
     var archive = target
     var temporaryCopy: String? = nil
     if !looksLikeZip(target) && !isZipName(target) {
-        // 文件 App 有时会把压缩包拷成不带 .zip 后缀的名字，复制一份再交给 unzip
+        // 文件 App 有时会把压缩包拷成不带 .zip 后缀的名字
         let copyPath = "\(kImportStaging)/\(stagingID)-input.zip"
         if cp(target, copyPath) == 0 {
             temporaryCopy = copyPath
@@ -346,7 +420,7 @@ func importProjectArchive(target: String) -> ImportOutcome {
 func adoptStagedDirectory(_ staging: String) -> ImportOutcome {
     let fm = FileManager.default
 
-    // 1) 已经是 FCM 工程（sproj），支持多套一层目录
+    // 1) 已经是 FCM 工程（含 Resources/DontTouchMe.plist），允许外面多套几层
     if let root = findProjectRoot(in: staging) {
         return installProject(from: root)
     }
@@ -360,66 +434,24 @@ func adoptStagedDirectory(_ staging: String) -> ImportOutcome {
         return .fail("压缩包是空的")
     }
 
-    // 2) 包里只有一个目录：可能多套了一层
-    if visible.count == 1 {
-        let candidate = "\(staging)/\(visible[0])"
-        var isDir: ObjCBool = false
-        if fm.fileExists(atPath: candidate, isDirectory: &isDir), isDir.boolValue {
-            if let inner = findProjectRoot(in: candidate) {
-                return installProject(from: inner)
-            }
-            return adoptSourceDirectory(candidate, fallbackName: visible[0])
+    // 2) 只有一个目录：可能是 repo-main/ 或仓库名那一层，剥掉再判断
+    var source = staging
+    var displayName: String? = nil
+
+    if let sub = singleSubdirectory(of: staging) {
+        if let inner = findProjectRoot(in: sub) {
+            return installProject(from: inner)
         }
-    }
-
-    // 3) 普通源码包
-    return adoptSourceDirectory(staging, fallbackName: nil)
-}
-
-/// 把工程目录移动到 Documents 下并返回结果
-private func installProject(from root: String) -> ImportOutcome {
-    let targetUUID = "\(UUID())"
-    let destination = "\(global_documents)/\(targetUUID)"
-
-    // 拷贝（不直接移动，避免源在同一目录下时出问题）
-    let copyResult = cp(root, destination)
-    if copyResult != 0 {
-        return .fail("安装工程失败（拷贝文件出错）")
-    }
-
-    repairProjectDirectory(destination)
-    let base = UserDefaults.standard.string(forKey: "sdk") ?? "iPhoneOS15.6.sdk"
-    if (rplist(forKey: "SDK", plistPath: "\(destination)/Resources/DontTouchMe.plist") ?? "").isEmpty {
-        _ = wplist(value: base, forKey: "SDK", plistPath: "\(destination)/Resources/DontTouchMe.plist")
-    }
-
-    let name = rplist(forKey: "CFBundleExecutable", plistPath: "\(destination)/Resources/Info.plist")
-        ?? "已导入工程"
-    return .success("已导入工程「\(name)」", destination)
-}
-
-/// 普通源码包：根据结构决定是「包一层工程外壳」还是「直接放进当前目录」
-private func adoptSourceDirectory(_ source: String, fallbackName: String?) -> ImportOutcome {
-    let scan = scanSources(in: source)
-    if scan.files == 0 {
-        return .fail("压缩包里没有可识别的源码文件")
-    }
-
-    let name = fallbackName ?? ((source as NSString).lastPathComponent)
-
-    // 有嵌套源码目录（说明是完整 App 工程树），或者是 C 二进制工程，就造一个工程外壳
-    // 根目录下直接摊开的源码（如 main.c / main.m）按二进制工程处理
-    let rootFiles = (try? FileManager.default.contentsOfDirectory(atPath: source)) ?? []
-    let hasRootSource = rootFiles.contains { kSourceExtensions.contains(($0 as NSString).pathExtension.lowercased()) }
-    let needsWrap = hasRootSource || scan.maxDepth >= 2 || !FileManager.default.fileExists(atPath: "\(source)/Resources")
-    if needsWrap {
-        let wrapped = wrapSourcesAsProject(source, name: name)
-        guard let projectPath = wrapped else {
-            return .fail("创建工程外壳失败")
+        // 极少数情况还会再套一层（如 repo-main/src），仍含工程结构时也剥掉
+        if let deeper = singleSubdirectory(of: sub), findProjectRoot(in: deeper) != nil {
+            return installProject(from: deeper)
         }
-        return .success("已导入工程「\(name)」", projectPath)
+        source = sub
+        // 用被剥掉那一层的名字做显示名，去掉 -main / -master / -<分支> 后缀
+        displayName = cleanRepoName((sub as NSString).lastPathComponent)
     }
-    return .success("已导入 \(scan.files) 个源码文件", nil)
+
+    return adoptSourceDirectory(source, fallbackName: displayName)
 }
 
 /// 把 zip 内容导入到某个目录内（工程里「导入」按钮用）

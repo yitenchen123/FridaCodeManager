@@ -44,14 +44,14 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     //API Text     info[7]
 
     if !isBashSafe(filename: ProjectInfo.Executable) {
-        print("Error: melicious project detected")
+        print("错误：检测到可疑工程")
         return 1;
     }
 
     let fileManager = FileManager.default
 
     if !fileManager.fileExists(atPath: info[3]) {
-       print("SDK \"\(ProjectInfo.SDK)\" doesn't exist, make sure to download the SDK in Settings > SDK Hub\n")
+       print("找不到 SDK \"\(ProjectInfo.SDK)\"。\n请前往「设置 > SDK 中心」下载，或在「工程设置 > SDK」里换一个已安装的 SDK。\n")
        return 1;
     }
 
@@ -94,7 +94,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         \(FileManager.default.fileExists(atPath: info[5]) ? "-import-objc-header '\(info[5])'" : "") -parse-as-library -target arm64-apple-ios\(ProjectInfo.TG) -o '\(info[1])/\(ProjectInfo.Executable)'
         """
         #elseif trollstore
-        print("Swift is currently not supported on trollstore edition!\n")
+        print("TrollStore 版本目前不支持 Swift 工程！\n")
         return 1
         #endif
     } else {
@@ -158,7 +158,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     dylock("\(Bundle.main.bundlePath)/toolchain/bin/clang.dylib");
     for file in MFiles {
         if dyexec("\(Bundle.main.bundlePath)/toolchain/bin/clang.dylib", "clang -I\(Bundle.main.bundlePath)/toolchain/lib/clang/16.0.0/include -isysroot \(info[3]) -target arm64-apple-ios\(ProjectInfo.TG) -c \(ProjectInfo.ProjectPath)/\(file) -o \(info[4])/\(UUID()).o") != 0 {
-            print("[!] clang mostlikely broke, please restart the app if clang didn't told you what exactly went wrong!\n")
+            print("[!] clang 可能已崩溃。如果 clang 没有给出具体错误，请重启应用后重试！\n")
             _ = rm(info[0])
             _ = rm(info[4])
             return -1
@@ -168,7 +168,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     //MachO!!
     let ofiles = FindFilesStack(ProjectInfo.ProjectPath, [".o"], splitAndTrim(apiextension.ign) + ["Resources"])
     if dyexec("\(Bundle.main.bundlePath)/toolchain/bin/ld.dylib", "ld -ObjC -lc -lc++ \(ofiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) -syslibroot \(info[3]) \(frameflags) -o \(info[1])/\(ProjectInfo.Executable)") != 0 {
-        print("[!] linking failed!\n")
+        print("[!] 链接失败！\n")
         _ = rm(info[0])
         _ = rm(info[4])
         return -1
