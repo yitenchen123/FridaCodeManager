@@ -135,12 +135,16 @@ struct SDKDownload: View {
                 DispatchQueue.main.async { status = "正在下载 iOS \(sdk) SDK…（\(host)）" }
 
                 _ = rm(target)
-                fdownload(url, target)
+                let result = httpDownload(url, to: target)
+                if !result.ok {
+                    lastError = "\(host)：\(result.error)"
+                    _ = rm(target)
+                    continue
+                }
 
-                // fdownload 失败时不创建文件，靠文件大小判断是否真的下到了
                 let size = ((try? FileManager.default.attributesOfItem(atPath: target))?[.size] as? NSNumber)?.intValue ?? 0
                 if size < 1024 {
-                    lastError = "\(host) 无响应或返回为空"
+                    lastError = "\(host) 返回内容为空"
                     _ = rm(target)
                     continue
                 }
@@ -168,6 +172,62 @@ struct SDKDownload: View {
                 }
             }
         }
+    }
+
+    /// 原生 Swift 下载（替代 C 版 fdownload）
+    /// fdownload 内部把相对路径拼到 contgen() 下，tmp 目录不存在时 moveItem 会静默失败，
+    /// 而且它的错误只 printf 到 stdout，Swift 侧完全拿不到。这里自己实现并可返回具体原因。
+    private func httpDownload(_ urlString: String, to destination: String) -> (ok: Bool, error: String) {
+        guard let url = URL(string: urlString) else {
+            return (false, "地址无效")
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 60
+        request.setValue("FridaCodeManager", forHTTPHeaderField: "User-Agent")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+
+        var ok = false
+        var message = "未知错误"
+        let semaphore = DispatchSemaphore(value: 0)
+
+        let task = URLSession.shared.downloadTask(with: request) { location, response, error in
+            defer { semaphore.signal() }
+
+            if let error = error {
+                message = error.localizedDescription
+                return
+            }
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                message = "HTTP \(http.statusCode)"
+                return
+            }
+            guard let location = location else {
+                message = "没有返回数据"
+                return
+            }
+            do {
+                if FileManager.default.fileExists(atPath: destination) {
+                    try? FileManager.default.removeItem(atPath: destination)
+                }
+                // 目标目录必须存在，否则 moveItem 失败
+                let dir = (destination as NSString).deletingLastPathComponent
+                if !dir.isEmpty {
+                    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                }
+                try FileManager.default.moveItem(at: location, to: URL(fileURLWithPath: destination))
+                ok = true
+            } catch {
+                message = "保存失败：\(error.localizedDescription)"
+            }
+        }
+        task.resume()
+
+        if semaphore.wait(timeout: .now() + 120) == .timedOut {
+            task.cancel()
+            return (false, "超时（120 秒）")
+        }
+        return (ok, ok ? "" : message)
     }
 
     /// 解压 zip 到 SDK 目录，处理权限问题
