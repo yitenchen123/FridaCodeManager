@@ -230,24 +230,38 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     if !SwiftFiles.isEmpty {
         #if jailbreak
         if !MFiles.isEmpty {
+            // 注意：shell() 用 bash -e 执行，任何一条 clang 返回非 0 都会让整个脚本立刻退出，
+            // 表现为"编译到第 N 个文件就中断、且不打印 error"。
+            // 所以每条命令都显式吞掉退出码并记录失败文件，全部跑完再统一判定。
+            EXEC += "FAILFILE=\\\"\\\"; "
             EXEC += MFiles.map { mFile in
-                "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build_sub) -target arm64-apple-ios\(ProjectInfo.TG) -c \(quoted(ProjectInfo.ProjectPath, mFile)) \(AFiles.joined(separator: " ")) -o '\(info[4])/\(UUID()).o' ; "
+                "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build_sub) -target arm64-apple-ios\(ProjectInfo.TG) -c \(quoted(ProjectInfo.ProjectPath, mFile)) \(AFiles.joined(separator: " ")) -o '\(info[4])/\(UUID()).o' || FAILFILE=\"$FAILFILE \(mFile)\" ; "
             }.joined()
         }
         EXEC += """
         swiftc -D\(ProjectInfo.Macro) \(quotedList(ProjectInfo.ProjectPath, SwiftFiles)) \(quotedList(ProjectInfo.ProjectPath, AFiles)) \(MFiles.isEmpty ? "" : "clang/*.o") \(apiextension.build) \
         \(FileManager.default.fileExists(atPath: info[5]) ? "-import-objc-header '\(info[5])'" : "") -parse-as-library -target arm64-apple-ios\(ProjectInfo.TG) -o '\(info[1])/\(ProjectInfo.Executable)'
         """
+        // Objective-C 侧若有文件编译失败，在这里统一报告，避免被 swiftc 的结果掩盖
+        EXEC += "\nif [ -n \\"$FAILFILE\\" ]; then echo \\"以下文件编译失败：\\"; for f in $FAILFILE; do echo \\"  $f\\"; done; exit 1; fi\n"
         #elseif trollstore
         print("TrollStore 版本目前不支持 Swift 工程！\n")
         return 1
         #endif
     } else {
         #if jailbreak
+        // 纯 ObjC 工程：同样逐文件编译，单文件失败不中断。
+        // 之前一次性把 239 个文件塞给 clang，任何一处失败就整体中止且不报错。
+        EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -rf clang && mkdir -p clang ; FAILFILE=\"\" ; "
+        EXEC += MFiles.map { mFile in
+            "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) -c \(quoted(ProjectInfo.ProjectPath, mFile)) -o 'clang/\(UUID()).o' || FAILFILE=\"$FAILFILE \(mFile)\" ; "
+        }.joined()
         EXEC += """
-        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, MFiles)) \(quotedList(ProjectInfo.ProjectPath, AFiles)) \
-        -o '\(info[1])/\(ProjectInfo.Executable)'
+        cd '\(ProjectInfo.ProjectPath)' ; \
+        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, AFiles)) \
+        clang/*.o -o '\(info[1])/\(ProjectInfo.Executable)' || FAILFILE="$FAILFILE <链接阶段>"
         """
+        EXEC += "\nif [ -n \"$FAILFILE\" ]; then echo \"以下文件编译失败：\"; for f in $FAILFILE; do echo \"  $f\"; done; exit 1; fi\n"
         #elseif trollstore
         EXEC += """
         clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, MFiles)) \(quotedList(ProjectInfo.ProjectPath, AFiles)) \
