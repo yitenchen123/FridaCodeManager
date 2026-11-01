@@ -32,6 +32,46 @@ import Foundation
 import SwiftUI
 import Darwin
 
+/// 扫描工程内的头文件搜索路径
+/// 规则：目录名是 include / Headers / include* 的，或其父目录是 mbedtls / openssl 这类标准布局
+func discoverHeaderPaths(_ projectPath: String) -> String {
+    let fm = FileManager.default
+    var paths: [String] = [projectPath]
+
+    guard let en = fm.enumerator(atPath: projectPath) else { return "" }
+    var count = 0
+    for case let item as String in en {
+        count += 1
+        if count > 20000 { break }
+        var isDir: ObjCBool = false
+        let full = "\(projectPath)/\(item)"
+        guard fm.fileExists(atPath: full, isDirectory: &isDir), isDir.boolValue else { continue }
+
+        let name = (item as NSString).lastPathComponent
+        // 跳过构建产物与 VCS 目录
+        if name == ".git" || name == "build" || name == "Payload" || name == "clang" ||
+           name == "node_modules" || name.hasPrefix(".") {
+            en.skipDescendants()
+            continue
+        }
+        let lower = name.lowercased()
+        // 常见头文件目录
+        if lower == "include" || lower == "includes" || lower == "headers" ||
+           lower == "include_debug" || lower == "public" {
+            paths.append(full)
+        }
+    }
+
+    // 去重并生成 -I 参数（加引号，路径可能含空格）
+    var seen = Set<String>()
+    var flags = ""
+    for path in paths where !seen.contains(path) {
+        seen.insert(path)
+        flags += " -I'\(path)'"
+    }
+    return flags
+}
+
 /// 找出本机真正可用的 SDK 名
 /// 优先：工程指定的（若已安装）→ 同主版本最高的 → 设置里的默认 → 任意一个已安装的
 func resolveAvailableSDK(_ requested: String) -> String {
@@ -137,12 +177,24 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     //setting up command
     messenger(status,progress,"setting up compiler",0.2)
 
+    // 扫描工程内的头文件目录。Xcode 工程用 HEADER_SEARCH_PATHS 指定这些路径，
+    // FCM 之前完全不知道，导致 #import <mbedtls/xxx.h> 这类写法必然找不到。
+    let headerFlags = discoverHeaderPaths(ProjectInfo.ProjectPath)
+
+    // 现代 Objective-C 基本都用 ARC；不开 ARC 时任何 __weak 都会直接报错
+    // （cannot create __weak reference in file using manual reference counting）。
+    // 如需关闭，在工程的 api.api 里写 <noarc>true</noarc>。
+    var objcFlags = " -fobjc-arc -fobjc-link-runtime" + headerFlags
+    if apiextension.noarc {
+        objcFlags = ""
+    }
+
     var EXEC = ""
     if !SwiftFiles.isEmpty {
         #if jailbreak
         if !MFiles.isEmpty {
             EXEC += MFiles.map { mFile in
-                "clang-14 -D\(ProjectInfo.Macro) -fmodules \(apiextension.build_sub) -target arm64-apple-ios\(ProjectInfo.TG) -c \(ProjectInfo.ProjectPath)/\(mFile) \(AFiles.joined(separator: " ")) -o '\(info[4])/\(UUID()).o' ; "
+                "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build_sub) -target arm64-apple-ios\(ProjectInfo.TG) -c '\(ProjectInfo.ProjectPath)/\(mFile)' \(AFiles.joined(separator: " ")) -o '\(info[4])/\(UUID()).o' ; "
             }.joined()
         }
         EXEC += """
@@ -156,12 +208,12 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     } else {
         #if jailbreak
         EXEC += """
-        clang-14 -D\(ProjectInfo.Macro) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(MFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \(AFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \
+        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(MFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \(AFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \
         -o '\(info[1])/\(ProjectInfo.Executable)'
         """
         #elseif trollstore
         EXEC += """
-        clang-14 -D\(ProjectInfo.Macro) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(MFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \(AFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \
+        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(MFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \(AFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \
         -o '\(info[1])/\(ProjectInfo.Executable)'
         """
         #endif

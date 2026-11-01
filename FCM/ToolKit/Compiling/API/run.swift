@@ -50,5 +50,7 @@ func api(_ text: String,_ Project:Project) -> ext {
         (build, build_sub, before, after, ignore) = (tags(apiclass,"build"), tags(apiclass,"build"),tags(apiclass,"exec-before"), tags(apiclass,"exec-after"), tags(apiclass,"compiler-ignore-content"))
     }
 
-    return ext(build: apicall(build,Project,false), build_sub: apicall(build_sub,Project,false), bef: apicall(before,Project,true), aft: apicall(after,Project,true), ign: apicall(ignore,Project,false))
+    let noarcFlag = tags(apiclass, "noarc").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let noarc = (noarcFlag == "true" || noarcFlag == "1" || noarcFlag == "yes")
+    return ext(build: apicall(build,Project,false), build_sub: apicall(build_sub,Project,false), bef: apicall(before,Project,true), aft: apicall(after,Project,true), ign: apicall(ignore,Project,false), noarc: noarc)
 }

@@ -165,8 +165,26 @@ func importGitHubRepo(_ input: String, token: String?, progress: ((String) -> Vo
         branch = "main"
     }
 
-    // 优先用 codeload（不占 API 配额），失败再退回 API 的 zipball
-    let candidates: [String] = [
+    // 优先 git clone --recursive：zip 不含子模块，依赖第三方库的工程会缺头文件
+    progress?("正在克隆 \(ref.slug)（\(branch)）…")
+    switch cloneRepo(ref, branch: branch, token: token, progress: progress) {
+    case .success(let dir):
+        progress?("正在创建工程…")
+        let outcome = adoptStagedDirectory(dir)
+        _ = rm(dir)
+        return outcome
+    case .needsAuth:
+        return .fail("私有仓库需要 Token，请切换到「使用 Token」并填写后再试")
+    case .notFound:
+        return .fail("仓库不存在：\(ref.slug)")
+    case .noGit:
+        progress?("未找到 git，改用 zip 下载（不含子模块）…")
+    case .failed(let reason):
+        progress?("git 克隆失败，改用 zip 下载…\n\(reason)")
+    }
+
+    // git 不可用时的回退：zip
+    let candidates = [
         "https://codeload.github.com/\(ref.owner)/\(ref.repo)/zip/refs/heads/\(branch)",
         "https://api.github.com/repos/\(ref.owner)/\(ref.repo)/zipball/\(branch)"
     ]
@@ -174,7 +192,7 @@ func importGitHubRepo(_ input: String, token: String?, progress: ((String) -> Vo
     var lastError = "下载失败"
     for (index, urlString) in candidates.enumerated() {
         guard let url = URL(string: urlString) else { continue }
-        progress?(index == 0 ? "正在下载 \(ref.slug)（\(branch)）…" : "正在重试（API 通道）…")
+        progress?(index == 0 ? "正在下载 \(ref.slug)…" : "重试中（API 通道）…")
         let (path, status, err) = ghDownload(url, token: token)
         if let path = path, (200...299).contains(status) {
             progress?("正在解压…")
@@ -195,17 +213,91 @@ func importGitHubRepo(_ input: String, token: String?, progress: ((String) -> Vo
             continue
         }
         switch status {
-        case 401:
-            lastError = "认证失败：Token 无效或已过期"
-        case 403:
-            lastError = "访问被拒绝：可能是 Token 权限不足或触发限流"
-        case 404:
-            lastError = "仓库不存在或为私有仓库（需要有效 Token）：\(ref.slug)"
-        case -1:
-            lastError = err ?? "网络请求失败"
-        default:
-            lastError = err ?? "下载失败（HTTP \(status)）"
+        case 401: lastError = "认证失败：Token 无效或已过期"
+        case 403: lastError = "访问被拒绝：Token 权限不足或触发限流"
+        case 404: lastError = "仓库不存在或为私有仓库：\(ref.slug)"
+        case -1:  lastError = err ?? "网络请求失败"
+        default:  lastError = err ?? "下载失败（HTTP \(status)）"
         }
     }
     return .fail(lastError)
+}
+
+// MARK: - git 克隆
+
+enum CloneResult {
+    case success(String)
+    case needsAuth
+    case notFound
+    case noGit
+    case failed(String)
+}
+
+/// 用 git clone --recursive 拉仓库（含子模块）
+private func cloneRepo(_ ref: GitHubRepoRef, branch: String, token: String?, progress: ((String) -> Void)?) -> CloneResult {
+    let fm = FileManager.default
+    let git = ["/var/jb/usr/bin/git", "/usr/bin/git", "/var/jb/bin/git", "/bin/git"]
+        .first { fm.isExecutableFile(atPath: $0) }
+    guard let gitPath = git else { return .noGit }
+
+    let destination = "\(global_container)/tmp/ghclone-\(UUID())"
+    _ = rm(destination)
+
+    // 带 token 的地址只用于 clone 命令，不落盘到 .git/config
+    var remote = "https://github.com/\(ref.owner)/\(ref.repo).git"
+    if let token = token, !token.isEmpty {
+        remote = "https://x-access-token:\(token)@github.com/\(ref.owner)/\(ref.repo).git"
+    }
+
+    let depth = "--depth 1"
+    let command = "'\(gitPath)' clone \(depth) --recursive --branch '\(branch)' '\(remote)' '\(destination)'"
+
+    progress?("正在克隆（含子模块，可能较慢）…")
+    let output = runPS(command: command, uid: 501)
+
+    if output.code != 0 {
+        // 再试一次不带 --branch（分支可能不是默认名）
+        let retry = "'\(gitPath)' clone \(depth) --recursive '\(remote)' '\(destination)'"
+        let r2 = runPS(command: retry, uid: 501)
+        if r2.code != 0 {
+            let log = (r2.log.isEmpty ? output.log : r2.log)
+            if log.contains("Authentication failed") || log.contains("could not read Username") {
+                return .needsAuth
+            }
+            if log.contains("not found") || log.contains("Repository not found") {
+                return .notFound
+            }
+            return .failed(log.isEmpty ? "退出码 \(r2.code)" : log)
+        }
+    }
+
+    // 清掉 .git 里的凭据痕迹
+    let config = "\(destination)/.git/config"
+    if let text = try? String(contentsOfFile: config, encoding: .utf8) {
+        let cleaned = text.replacingOccurrences(of: remote, with: "https://github.com/\(ref.owner)/\(ref.repo).git")
+        try? cleaned.write(toFile: config, atomically: true, encoding: .utf8)
+    }
+    return .success(destination)
+}
+
+/// 执行命令并捕获输出
+private func runPS(command: String, uid: uid_t) -> (code: Int, log: String) {
+    let logPath = "\(global_container)/tmp/gh-\(UUID()).log"
+    let wrapped = command + " > '\(logPath)' 2>&1"
+    let code = shell(wrapped, uid: uid, env: [])
+    var text = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
+    _ = rm(logPath)
+    if text.count > 500 { text = String(text.suffix(500)) }
+    return (code, text.trimmingCharacters(in: .whitespacesAndNewlines))
+}
+
+/// 把克隆下来的仓库收编成工程（保留 .git，方便之后推送）
+private func adoptClonedRepo(_ dir: String, name: String) -> ImportOutcome {
+    let outcome = adoptStagedDirectory(dir)
+    // adoptStagedDirectory 会移动目录，所以克隆目录已经不存在了；只做清理
+    _ = rm(dir)
+    if !outcome.ok {
+        return outcome
+    }
+    return outcome
 }

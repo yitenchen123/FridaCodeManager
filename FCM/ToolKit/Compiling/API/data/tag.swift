@@ -37,6 +37,8 @@ struct ext {
     let bef: String
     let aft: String
     let ign: String
+    /// 工程显式要求关闭 ARC（api.api 里写 <noarc>true</noarc>）
+    var noarc: Bool = false
 }
 
 func tags(_ inputString: String,_ tag: String) -> String {
