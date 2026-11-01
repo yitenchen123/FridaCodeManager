@@ -177,6 +177,18 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     //setting up command
     messenger(status,progress,"setting up compiler",0.2)
 
+    // 如果工程带 .github/workflows，优先执行其中的依赖准备步骤。
+    // 很多项目的第三方库（mbedtls / JRE / 预编译 dylib）不进 git，
+    // 而是在 CI 里现下，直接编译必然缺头文件。
+    let prepSteps = ciPrepSteps(for: ProjectInfo.ProjectPath)
+    if !prepSteps.isEmpty {
+        _ = climessenger("ci-prep", "检测到 \(prepSteps.count) 个 CI 准备步骤，开始执行…")
+        _ = runCIPrepSteps(prepSteps, projectPath: ProjectInfo.ProjectPath) { line in
+            _ = climessenger("ci-prep", line)
+        }
+        // 依赖下载完可能新增了头文件目录，重新扫描
+    }
+
     // 扫描工程内的头文件目录。Xcode 工程用 HEADER_SEARCH_PATHS 指定这些路径，
     // FCM 之前完全不知道，导致 #import <mbedtls/xxx.h> 这类写法必然找不到。
     let headerFlags = discoverHeaderPaths(ProjectInfo.ProjectPath)
