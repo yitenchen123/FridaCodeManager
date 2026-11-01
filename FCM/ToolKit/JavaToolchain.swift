@@ -77,13 +77,26 @@ func detectJavaToolchain(projectPath: String) -> JavaToolchainInfo {
     for candidate in standardJDKCandidates {
         let javac = "\(candidate)/bin/javac"
         let tools = "\(candidate)/lib/tools.jar"
-        guard fm.isExecutableFile(atPath: javac) else { continue }
+
+        // 用「文件存在」而不是「可执行」判断：
+        // 从 zip 解压出来的文件是 644，没有执行位，
+        // 用 isExecutableFile 会把刚导入的 JDK 直接跳过。
+        guard fm.fileExists(atPath: javac) else { continue }
+
+        // 发现 JDK 后补执行权限（幂等）
+        shell("chmod -R +x '\(candidate)/bin' 2>/dev/null", uid: 501, env: [])
+        #if !stock
+        if !fm.isExecutableFile(atPath: javac) {
+            shell("chmod -R +x '\(candidate)/bin' 2>/dev/null", uid: 0, env: [])
+        }
+        #endif
+
         // 完整 JDK 应同时具备 tools.jar（javac 的实现）
         let isFullJDK = fm.fileExists(atPath: tools)
 
         info.home = candidate
         info.javacPath = javac
-        info.jarPath = fm.isExecutableFile(atPath: "\(candidate)/bin/jar") ? "\(candidate)/bin/jar" : nil
+        info.jarPath = fm.fileExists(atPath: "\(candidate)/bin/jar") ? "\(candidate)/bin/jar" : nil
         info.source = isFullJDK ? "标准 JDK（含 tools.jar）" : "JDK 布局"
         if candidate.hasPrefix(Bundle.main.bundlePath) {
             info.source += "，随 FCM 内置"

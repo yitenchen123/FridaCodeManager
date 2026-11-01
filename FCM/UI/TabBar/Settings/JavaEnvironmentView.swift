@@ -208,6 +208,13 @@ struct JavaEnvironmentView: View {
             return (false, "解压成功，但压缩包里没有 bin/javac\n\n解压后的结构：\n" + listing)
         }
 
+        // 补执行权限：zip 解出来的文件是 644，
+        // 不补的话 javac 无法执行（后面所有检测都会失败）
+        shell("chmod -R +x '\(jdkRoot)/bin' 2>/dev/null", uid: 501, env: [])
+        #if !stock
+        shell("chmod -R +x '\(jdkRoot)/bin' 2>/dev/null", uid: 0, env: [])
+        #endif
+
         // 检查是否含 tools.jar（javac 实现）
         let hasTools = fm.fileExists(atPath: "\(jdkRoot)/lib/tools.jar")
 
@@ -262,19 +269,28 @@ struct JavaEnvironmentView: View {
     }
 
     /// 在解压目录里找 JDK 根（含 bin/javac）
+    ///
+    /// 注意：不能用 isExecutableFile 判断。
+    /// zip 解压出来的文件默认是 644（无执行位），
+    /// 要先把权限补上再检测，否则永远找不到。
     private func findJDKRoot(in dir: String) -> String? {
         let fm = FileManager.default
-        if fm.isExecutableFile(atPath: "\(dir)/bin/javac") { return dir }
+
+        func hasJavac(_ path: String) -> Bool {
+            return fm.fileExists(atPath: "\(path)/bin/javac")
+        }
+
+        if hasJavac(dir) { return dir }
 
         guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return nil }
         for entry in entries {
             let sub = "\(dir)/\(entry)"
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: sub, isDirectory: &isDir), isDir.boolValue else { continue }
-            if fm.isExecutableFile(atPath: "\(sub)/bin/javac") { return sub }
+            if hasJavac(sub) { return sub }
             // 再深一层（某些发行版会多套 jdk8/jdk1.8.0_xxx）
             if let subs = try? fm.contentsOfDirectory(atPath: sub) {
-                for s in subs where fm.isExecutableFile(atPath: "\(sub)/\(s)/bin/javac") {
+                for s in subs where hasJavac("\(sub)/\(s)") {
                     return "\(sub)/\(s)"
                 }
             }
