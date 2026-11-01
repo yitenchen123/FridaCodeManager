@@ -227,6 +227,13 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     // 如果工程带 .github/workflows，优先执行其中的依赖准备步骤。
     // 很多项目的第三方库（mbedtls / JRE / 预编译 dylib）不进 git，
     // 而是在 CI 里现下，直接编译必然缺头文件。
+    // Swift Package 依赖：先尝试解析，失败不阻断（设备可能没装 swift）
+    if hasSwiftPackageDependencies(projectPath: ProjectInfo.ProjectPath) {
+        _ = resolveSwiftPackages(projectPath: ProjectInfo.ProjectPath) { line in
+            _ = climessenger("spm", line)
+        }
+    }
+
     let prepSteps = ciPrepSteps(for: ProjectInfo.ProjectPath)
     if !prepSteps.isEmpty {
         _ = climessenger("ci-prep", "检测到 \(prepSteps.count) 个 CI 准备步骤，开始执行…")
@@ -480,6 +487,22 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         _ = climessenger("bundle-hint", "链接阶段没有产出，请查看上面的编译日志")
         _ = rm(info[0])
         return 1
+    }
+
+    // ---------------- 脚本阶段 ----------------
+    // Xcode 的顺序：编译 → 链接 → 拷资源 → 脚本阶段 → 签名。
+    // 很多 GitHub 项目把依赖下载、资源拷贝放在这里，
+    // 不执行就会缺文件（Air2 的 Java 核心与运行时资源即如此）。
+    let shellPhases = loadShellBuildPhases(projectPath: ProjectInfo.ProjectPath)
+    if !shellPhases.isEmpty {
+        messenger(status, progress, "执行构建脚本", 0.5)
+        _ = climessenger("shell-phase", "检测到 \(shellPhases.count) 个脚本阶段")
+        _ = runShellBuildPhases(shellPhases,
+                                projectPath: ProjectInfo.ProjectPath,
+                                appPath: stagingApp,
+                                configuration: erase ? "Release" : "Debug") { line in
+            _ = climessenger("shell-phase", line)
+        }
     }
 
     // ---------------- 签名 ----------------
