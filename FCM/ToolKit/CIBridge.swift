@@ -225,6 +225,22 @@ func ciPrepSteps(for projectPath: String) -> [CIPrepStep] {
 func runCIPrepSteps(_ steps: [CIPrepStep], projectPath: String, log: (String) -> Void) -> Bool {
     guard !steps.isEmpty else { return true }
 
+    // 前置检查：这些步骤大多依赖 python3，设备上没装时直接给出明确提示，
+    // 否则只会看到一个含糊的"退出码 32512"。
+    var missingTools: [String] = []
+    for tool in ["python3", "git", "curl"] {
+        let found = shell("command -v \(tool) >/dev/null 2>&1", uid: 501, env: []) == 0
+        if !found { missingTools.append(tool) }
+    }
+
+    if !missingTools.isEmpty {
+        log("缺少依赖：\(missingTools.joined(separator: "、"))")
+        log("CI 准备步骤需要这些工具。安装命令：")
+        log("  apt install \(missingTools.map { $0 == "python3" ? "python3" : $0 }.joined(separator: " "))")
+        log("跳过 CI 准备步骤，直接开始编译（可能因缺依赖而失败）")
+        return false
+    }
+
     for (index, step) in steps.enumerated() {
         log("[\(index + 1)/\(steps.count)] \(step.title)（\(step.reason)）")
 

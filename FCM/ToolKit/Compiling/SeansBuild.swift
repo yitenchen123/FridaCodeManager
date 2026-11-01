@@ -234,7 +234,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
             // 所以每条命令都用 || 记录失败文件名，全部跑完再统一判定。
             EXEC += #"FAILFILE=""; "#
             EXEC += MFiles.map { mFile in
-                "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build_sub) -target arm64-apple-ios\(ProjectInfo.TG) -c \(quoted(ProjectInfo.ProjectPath, mFile)) \(AFiles.joined(separator: " ")) -o '\(info[4])/\(UUID()).o' || FAILFILE=\"$FAILFILE \(mFile)\" ; "
+                "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build_sub) -target arm64-apple-ios\(ProjectInfo.TG) -c \(quoted(ProjectInfo.ProjectPath, mFile)) \(AFiles.joined(separator: " ")) -o '\(info[4])/\(UUID()).o' || FAILFILE=\"\$FAILFILE \(mFile)\" ; "
             }.joined()
         }
         EXEC += """
@@ -254,7 +254,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -rf clang && mkdir -p clang ; "
         EXEC += #"FAILFILE=""; "#
         EXEC += MFiles.map { mFile in
-            "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) -c \(quoted(ProjectInfo.ProjectPath, mFile)) -o 'clang/\(UUID()).o' || FAILFILE=\"$FAILFILE \(mFile)\" ; "
+            "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) -c \(quoted(ProjectInfo.ProjectPath, mFile)) -o 'clang/\(UUID()).o' || FAILFILE=\"\$FAILFILE \(mFile)\" ; "
         }.joined()
         EXEC += """
         clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, AFiles)) clang/*.o -o '\(info[1])/\(ProjectInfo.Executable)'
@@ -304,7 +304,17 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         }
     }
     messenger(status,progress,"compiling \(ProjectInfo.Executable)",0.4)
-    if climessenger("compiler-stage","","\(CDEXEC) ; \(EXEC)", nil, bashenv) != 0 {
+    // 不能把整个编译脚本作为 `bash -c` 的单个参数传进去：
+    // Air2 有 239 个 .m，拼出来的脚本约 86KB，
+    // posix_spawn 会因单个 argv 项过长而直接失败（日志里表现为 Failed to spawn process）。
+    // 改为先写脚本文件再执行，长度不受 argv 限制。
+    let buildScript = "\(global_container)/tmp/fcm-build.sh"
+    _ = rm(buildScript)
+    let scriptBody = "#!/var/jb/usr/bin/bash\nset +e\n" + CDEXEC + "\n" + EXEC + "\n"
+    cfile(atPath: buildScript, withContent: scriptBody)
+    shell("chmod +x '\(buildScript)'", uid: 501, env: [])
+
+    if climessenger("compiler-stage","","'\(buildScript)'", nil, bashenv) != 0 {
         _ = climessenger("compiling-failed","compiling \(ProjectInfo.Executable) failed")
         _ = rm(info[0])
         _ = rm(info[4])
