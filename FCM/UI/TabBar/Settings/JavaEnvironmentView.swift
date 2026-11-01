@@ -163,24 +163,49 @@ struct JavaEnvironmentView: View {
             return (false, "无法读取该文件，请重新选择")
         }
 
-        // 解压：先 zip，再 tar
-        var extracted = libzip_unzip(local, staging) == 0
+        // 解压：三级回退
+        //   1. 系统 unzip（最可靠，能处理 libzip 不支持的包）
+        //   2. libzip（App 内置，无外部依赖）
+        //   3. tar（仅对 tar.gz/tgz 有效）
+        // 注意：不能用 tar 解 zip，那是两种完全不同的格式。
+        var extracted = false
+
+        if let unzipBin = ["/var/jb/usr/bin/unzip", "/usr/bin/unzip", "/var/jb/bin/unzip"]
+            .first(where: { fm.isExecutableFile(atPath: $0) }) {
+            extracted = shell("'\(unzipBin)' -q -o '\(local)' -d '\(staging)'", uid: 501, env: []) == 0
+            if !extracted {
+                // 权限问题（目标目录属于 root）时提权重试
+                #if !stock
+                extracted = shell("'\(unzipBin)' -q -o '\(local)' -d '\(staging)'", uid: 0, env: []) == 0
+                #endif
+            }
+        }
+
         if !extracted {
-            if let tar = ["/var/jb/usr/bin/tar", "/usr/bin/tar"].first(where: { fm.isExecutableFile(atPath: $0) }) {
-                extracted = shell("'\(tar)' -xzf '\(local)' -C '\(staging)' 2>/dev/null", uid: 501, env: []) == 0
+            extracted = libzip_unzip(local, staging) == 0
+        }
+
+        if !extracted {
+            // 只有 tar 系列才走这条路
+            let lower = fileURL.lastPathComponent.lowercased()
+            if lower.hasSuffix(".tgz") || lower.hasSuffix(".tar.gz") || lower.hasSuffix(".tar"),
+               let tar = ["/var/jb/usr/bin/tar", "/usr/bin/tar"].first(where: { fm.isExecutableFile(atPath: $0) }) {
+                extracted = shell("'\(tar)' -xf '\(local)' -C '\(staging)' 2>/dev/null", uid: 501, env: []) == 0
             }
         }
         _ = rm(local)
 
         guard extracted else {
             _ = rm(staging)
-            return (false, "解压失败，请确认是有效的 zip 或 tar.gz")
+            return (false, "解压失败：找不到可用的解压工具或压缩包已损坏\n\n可尝试：apt install unzip")
         }
 
         // 找到含 bin/javac 的目录（可能多套一层）
         guard let jdkRoot = findJDKRoot(in: staging) else {
+            // 解压成功但结构不符：把实际看到的内容报出来，便于定位
+            let listing = describeDirectory(staging, depth: 2)
             _ = rm(staging)
-            return (false, "压缩包里没有找到 bin/javac，这似乎不是 JDK")
+            return (false, "解压成功，但压缩包里没有 bin/javac\n\n解压后的结构：\n" + listing)
         }
 
         // 检查是否含 tools.jar（javac 实现）
@@ -209,6 +234,31 @@ struct JavaEnvironmentView: View {
             message += "请确认导入的是完整 JDK（不是 JRE）。"
         }
         return (hasTools, message)
+    }
+
+    /// 列出目录结构（最多两层），用于错误提示
+    private func describeDirectory(_ path: String, depth: Int) -> String {
+        let fm = FileManager.default
+        var lines: [String] = []
+        func walk(_ dir: String, _ level: Int) {
+            guard level <= depth else { return }
+            guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return }
+            for entry in entries.sorted().prefix(12) {
+                var isDir: ObjCBool = false
+                fm.fileExists(atPath: "\(dir)/\(entry)", isDirectory: &isDir)
+                let indent = String(repeating: "  ", count: level)
+                lines.append(indent + entry + (isDir.boolValue ? "/" : ""))
+                if isDir.boolValue && level < depth {
+                    walk("\(dir)/\(entry)", level + 1)
+                }
+            }
+            if entries.count > 12 {
+                lines.append(String(repeating: "  ", count: level) + "…（共 \(entries.count) 项）")
+            }
+        }
+        walk(path, 0)
+        if lines.isEmpty { return "（空目录）" }
+        return lines.prefix(20).joined(separator: "\n")
     }
 
     /// 在解压目录里找 JDK 根（含 bin/javac）
