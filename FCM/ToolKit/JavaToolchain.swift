@@ -59,8 +59,6 @@ func detectJavaToolchain(projectPath: String) -> JavaToolchainInfo {
     let fm = FileManager.default
     var info = JavaToolchainInfo()
 
-    let projectName = (projectPath as NSString).lastPathComponent
-
     // ---- 1) 工程自带的 JRE ----
     var candidates: [(String, String)] = []   // (home, 来源说明)
     let searchRoots = [
