@@ -259,18 +259,23 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         #endif
     } else {
         #if jailbreak
-        // 纯 ObjC 工程：逐文件编译，单文件失败不中断，
-        // 否则 239 个文件里任何一个出错都会整体中止且不打印 error。
-        EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -rf clang && mkdir -p clang ; "
-        EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -f " + FAIL_LOG + " ; "
-        EXEC += MFiles.map { mFile in
+        // 纯 ObjC 工程：并行编译，单文件失败不中断。
+        // 并行编译：每个编译单元写成一行，交给 xargs -P 多进程执行，
+        // 与 Xcode 默认的并行编译一致。失败的文件名统一收集到 FAIL_LOG。
+        let compileUnits = MFiles.map { mFile in
             [
                 "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) -c ",
                 quoted(ProjectInfo.ProjectPath, mFile),
-                " -o 'clang/", UUID().uuidString, ".o' || ",
-                "echo ", Q, mFile, Q, " >> " + FAIL_LOG
+                " -o 'clang/", UUID().uuidString, ".o' 2>/dev/null || echo ",
+                Q, mFile, Q
                 ].joined()
-        }.joined()
+        }
+        let unitsFile = "\(ProjectInfo.ProjectPath)/.fcm-units.txt"
+        cfile(atPath: unitsFile, withContent: compileUnits.joined(separator: "\n"))
+        EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -rf clang && mkdir -p clang ; rm -f " + FAIL_LOG + " ; "
+        EXEC += "JOBS=\$(sysctl -n hw.ncpu 2>/dev/null || echo 4) ; [ \"\$JOBS\" -gt 8 ] && JOBS=8 ; [ \"\$JOBS\" -lt 2 ] && JOBS=2 ; "
+        EXEC += "cat '" + unitsFile + "' | xargs -P \"\$JOBS\" -I {} sh -c '{}' >> " + FAIL_LOG + " ; "
+        EXEC += "rm -f '" + unitsFile + "' ; "
         EXEC += "mkdir -p '" + info[1] + "' ; "
         EXEC += """
         clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, AFiles)) clang/*.o -o '\(info[1])/\(ProjectInfo.Executable)'
@@ -306,109 +311,120 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     }
     #endif
 
-    try? copyc(from: info[2], to: info[1])
-    _ = rm("\(info[1])/DontTouchMe.plist")
+    // ---------------- 打包 .app ----------------
+    messenger(status, progress, BuildStage.bundle.display, 0.45)
 
-    #if !stock
-    if !apiextension.bef.isEmpty {
-        messenger(status,progress,"running api-exec-stage (before)",0.3)
-        if climessenger("api-exec-stage","","\(CDEXEC) ; \(apiextension.bef)",nil,bashenv) != 0 {
-            _ = climessenger("error-occurred", "running api-exec-stage failed")
-            _ = rm(info[0])
-            _ = rm(info[4])
-            return 1
+    let stagingApp = info[1]
+    _ = rm(stagingApp)
+    cfolder(atPath: stagingApp)
+
+    do {
+        let contents = try FileManager.default.contentsOfDirectory(atPath: info[2])
+        for item in contents where item != "DontTouchMe.plist" && item != ".DS_Store" {
+            try FileManager.default.copyItem(atPath: "\(info[2])/\(item)",
+                                             toPath: "\(stagingApp)/\(item)")
         }
-    }
-    messenger(status,progress,"compiling \(ProjectInfo.Executable)",0.4)
-    // 不能把整个编译脚本作为 `bash -c` 的单个参数传进去：
-    // Air2 有 239 个 .m，拼出来的脚本约 86KB，
-    // posix_spawn 会因单个 argv 项过长而直接失败（日志里表现为 Failed to spawn process）。
-    // 改为先写脚本文件再执行，长度不受 argv 限制。
-    let buildScript = "\(global_container)/tmp/fcm-build.sh"
-    _ = rm(buildScript)
-    let scriptBody = "#!/var/jb/usr/bin/bash\nset +e\n" + CDEXEC + "\n" + EXEC + "\n"
-    cfile(atPath: buildScript, withContent: scriptBody)
-    shell("chmod +x '\(buildScript)'", uid: 501, env: [])
-
-    if climessenger("compiler-stage","","'\(buildScript)'", nil, bashenv) != 0 {
-        _ = climessenger("compiling-failed","compiling \(ProjectInfo.Executable) failed")
+    } catch {
+        _ = climessenger("bundle-stage", "复制资源失败：\(error.localizedDescription)")
         _ = rm(info[0])
-        _ = rm(info[4])
         return 1
     }
-    #else
-    // -->>> magic compiler <<<--
-    sethome(to: "\(global_documents)")
-    dylock("\(Bundle.main.bundlePath)/toolchain/bin/clang.dylib");
-    for file in MFiles {
-        if dyexec("\(Bundle.main.bundlePath)/toolchain/bin/clang.dylib", "clang -I\(Bundle.main.bundlePath)/toolchain/lib/clang/16.0.0/include -isysroot \(info[3]) -target arm64-apple-ios\(ProjectInfo.TG) -c \(ProjectInfo.ProjectPath)/\(file) -o \(info[4])/\(UUID()).o") != 0 {
-            print("[!] clang 可能已崩溃。如果 clang 没有给出具体错误，请重启应用后重试！\n")
-            _ = rm(info[0])
-            _ = rm(info[4])
-            return -1
-        }
-    }
-    dyunlock();
-    //MachO!!
-    let ofiles = FindFilesStack(ProjectInfo.ProjectPath, [".o"], splitAndTrim(apiextension.ign) + ["Resources"])
-    if dyexec("\(Bundle.main.bundlePath)/toolchain/bin/ld.dylib", "ld -ObjC -lc -lc++ \(quotedList(ProjectInfo.ProjectPath, ofiles)) -syslibroot \(info[3]) \(frameflags) -o \(info[1])/\(ProjectInfo.Executable)") != 0 {
-        print("[!] 链接失败！\n")
+
+    // ---------------- 签名 ----------------
+    messenger(status, progress, BuildStage.sign.display, 0.55)
+
+    let toolchain = detectToolchain()
+    if toolchain.ldidPath == nil {
+        _ = climessenger("sign-stage", "找不到 ldid，无法签名。安装：apt install ldid")
         _ = rm(info[0])
-        _ = rm(info[4])
-        return -1
+        return 1
     }
-    sethome(to: "\(global_container)")
-    // -->>> magic ending <<<--
-    #endif
 
-    #if !stock
-    messenger(status,progress,"running api-exec-stage (after)",0.5)
-    if !apiextension.aft.isEmpty {
-        if climessenger("api-exec-stage","","\(CDEXEC) ; \(apiextension.aft)",nil,bashenv) != 0 {
-            _ = climessenger("error-occurred", "running api-exec-stage failed")
-            _ = rm(info[0])
-            _ = rm(info[4])
-            return 1
+    let executablePath = "\(stagingApp)/\(ProjectInfo.Executable)"
+    let signResult = signBinary(executablePath, entitlements: info[6], ldid: toolchain.ldidPath!)
+    if !signResult.0 {
+        _ = climessenger("sign-stage", "签名失败：\(signResult.1)")
+        _ = climessenger("sign-hint", "请检查 entitlements.plist 是否与本机越狱环境匹配")
+        _ = rm(info[0])
+        return 1
+    }
+    _ = climessenger("sign-stage", "签名完成：\(ProjectInfo.Executable)")
+
+    // ---------------- 校验产物 ----------------
+    messenger(status, progress, BuildStage.verify.display, 0.65)
+
+    let bundleCheck = verifyAppBundle(stagingApp)
+    if !bundleCheck.0 {
+        _ = climessenger("verify-stage", "产物校验失败：")
+        for problem in bundleCheck.1 {
+            _ = climessenger("verify-stage", "  · \(problem)")
         }
+        _ = rm(info[0])
+        return 1
     }
-    #endif
 
+    let macho = verifyMachO(executablePath)
+    if !macho.0 {
+        _ = climessenger("verify-stage", "可执行文件校验失败：\(macho.1)")
+        _ = rm(info[0])
+        return 1
+    }
+    _ = climessenger("verify-stage", "架构：\(macho.1)，大小：\(readableSize(executablePath))")
+
+    // ---------------- 生成安装包 ----------------
+    messenger(status, progress, BuildStage.package.display, 0.75)
+
+    // 用工程名区分，避免多个工程同时构建互相覆盖
+    let ipaName = ProjectInfo.Executable.replacingOccurrences(of: " ", with: "_")
+    let ipaPath = "\(ProjectInfo.ProjectPath)/\(ipaName).ipa"
+
+    let packaged = packageIPA(appBundle: stagingApp, output: ipaPath, zipPath: toolchain.zipPath)
+    if !packaged.0 {
+        _ = climessenger("package-stage", "打包 ipa 失败：\(packaged.1)")
+        _ = rm(info[0])
+        return 1
+    }
+    _ = climessenger("package-stage", "已生成：\(ipaPath)（\(readableSize(ipaPath))）")
+
+    // ---------------- 安装 ----------------
     if ProjectInfo.TYPE == "Applications" {
-        messenger(status,progress,"compressing \(ProjectInfo.Executable) into .ipa archive",0.5)
-        #if !stock
-        shell("ldid -S'\(info[6])' '\(info[1])/\(ProjectInfo.Executable)'", uid: 0)
-        #endif
+        messenger(status, progress, "安装 \(ProjectInfo.Executable)", 0.85)
 
-        libzip_zip("\(ProjectInfo.ProjectPath)/Payload", "\(ProjectInfo.ProjectPath)/ts.ipa", true)
-
-        //installing app
-        messenger(status,progress,"installing \(ProjectInfo.Executable)",0.7)
-        var result: Int = 0
         #if !stock
         if erase {
             killTaskWithProcessName(ProjectInfo.Executable)
-            result = shell("\(Bundle.main.bundlePath)/tshelper install '\(ProjectInfo.ProjectPath)/ts.ipa' > /dev/null 2>&1", uid: 0)
-            _ = climessenger("install--stage","TrollStore Helper returned \(String(result))")
+            let installPath = "\(ProjectInfo.ProjectPath)/ts.ipa"
+            _ = rm(installPath)
+            if cp(ipaPath, installPath) != 0 {
+                _ = climessenger("install-stage", "复制 ipa 到安装位置失败")
+                _ = rm(info[0])
+                return 1
+            }
+            let result = shell("\(Bundle.main.bundlePath)/tshelper install '\(installPath)' > /dev/null 2>&1", uid: 0)
+            _ = climessenger("install-stage", "TrollStore Helper 返回 \(result)")
+            _ = rm(installPath)
+
+            _ = rm(info[0])
+            _ = rm(info[4])
+            if result != 0 {
+                _ = climessenger("install-hint", "安装未成功。可把生成的 ipa 传到设备，用 TrollStore / 自签工具安装。")
+                return result
+            }
+            return 0
         }
         #endif
+
         _ = rm(info[0])
         _ = rm(info[4])
-        if erase {
-            _ = rm("\(ProjectInfo.ProjectPath)/ts.ipa")
-        }
-        #if !stock
-        return result
-        #else
         return 0
-        #endif
     } else {
-        shell("ldid -S'\(info[6])' '\(info[1])/\(ProjectInfo.Executable)'")
-        let result = shell("\"\(info[1])/\(ProjectInfo.Executable)\"")
-        print("[*] Binary returned \(result)\n")
+        // 命令行工具：直接运行看返回值
+        let result = shell("\"\(executablePath)\"")
+        _ = climessenger("run-stage", "退出码 \(result)")
         _ = rm(info[0])
         _ = rm(info[4])
-        return 0;
-    } 
+        return 0
+    }
 }
 
 private func messenger(_ status: Binding<String>?,_ progress: Binding<Double>?,_ tstat: String,_  tproc: Double) -> Void {
