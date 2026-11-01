@@ -240,27 +240,103 @@ struct SDKDownload: View {
         defer { _ = rm(staged) }
 
         var extractError = ""
-        let zipResult = libzip_unzip(source, staged)
-        if zipResult != 0 {
-            let (ok, log) = unarchiveTar(source, to: staged)
-            if !ok {
-                extractError = log.isEmpty ? "无法识别压缩格式" : log
-            }
+        var diag: [String] = []
+
+        // 先记录环境，便于定位问题
+        diag.append("源文件: \(source)")
+        diag.append("大小: \(fileSizeString(source))")
+        diag.append("jbroot: \(jbroot)")
+        let tarPath = findTar()
+        diag.append("tar: \(tarPath ?? "未找到")")
+        diag.append("staged: \(staged)")
+
+        // 按文件头决定解压方式，不依赖扩展名，也不依赖 libzip 的返回值是否可信
+        let kind = sniffArchive(source)
+        diag.append("格式识别: \(kind)")
+
+        var extracted = false
+        if kind == "zip" {
+            extracted = libzip_unzip(source, staged) == 0
+            diag.append("libzip 解压: \(extracted ? "成功" : "失败")")
         }
+        if !extracted {
+            let (ok, log) = unarchiveTar(source, to: staged)
+            extracted = ok
+            diag.append("tar 解压: \(ok ? "成功" : "失败")")
+            if !log.isEmpty { diag.append("tar 输出: \(log)") }
+            if !ok { extractError = log.isEmpty ? "tar 执行失败且无输出" : log }
+        }
+
+        // 解压后清点文件数，便于判断是真的解开了还是空目录
+        let fileCount = countFiles(in: staged)
+        diag.append("解压出文件数: \(fileCount)")
 
         // 3) 找 SDK
         let found = collectSDKs(in: staged)
         if found.isEmpty {
             // 把目录结构带出来，方便判断到底是解压失败还是结构不符
             let listing = describeTree(staged, limit: 12)
-            var msg = "导入失败：压缩包里没有找到 iPhoneOS*.sdk 目录\n\n"
+            var msg = "导入失败：没有找到 iPhoneOS*.sdk\n\n"
+            msg += "解压结果：\n\(listing)\n\n"
             if !extractError.isEmpty {
-                msg += "解压错误：\(extractError)\n\n"
+                msg += "错误：\(extractError)\n\n"
             }
-            msg += "解压后的内容：\n\(listing)"
+            msg += "诊断：\n" + diag.joined(separator: "\n")
             return (false, msg)
         }
         return (true, "已导入 SDK：\n" + found.joined(separator: "\n"))
+    }
+
+    /// 通过文件头判断压缩格式
+    private func sniffArchive(_ path: String) -> String {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return "无法读取" }
+        defer { handle.closeFile() }
+        let head = handle.readData(ofLength: 6)
+        guard head.count >= 4 else { return "文件过小" }
+        let b = [UInt8](head)
+        if b[0] == 0x50 && b[1] == 0x4B && b[2] == 0x03 && b[3] == 0x04 { return "zip" }
+        if b[0] == 0x1F && b[1] == 0x8B { return "gzip(tar.gz/tgz)" }
+        if b[0] == 0x42 && b[1] == 0x5A { return "bzip2" }
+        if b[0] == 0xFD && b[1] == 0x37 { return "xz" }
+        // 未压缩 tar：偏移 257 处是 "ustar"
+        if let h2 = FileHandle(forReadingAtPath: path) {
+            defer { h2.closeFile() }
+            h2.seek(toFileOffset: 257)
+            let magic = h2.readData(ofLength: 5)
+            if magic == Data([0x75, 0x73, 0x74, 0x61, 0x72]) { return "tar" }
+        }
+        return "未知格式"
+    }
+
+    /// 递归统计文件数量（有上限，避免大包卡住）
+    private func countFiles(in path: String, limit: Int = 50000) -> Int {
+        let fm = FileManager.default
+        guard let en = fm.enumerator(atPath: path) else { return 0 }
+        var n = 0
+        for case let item as String in en {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: "\(path)/\(item)", isDirectory: &isDir), !isDir.boolValue {
+                n += 1
+                if n >= limit { break }
+            }
+        }
+        return n
+    }
+
+    /// 文件大小
+    private func fileSizeString(_ path: String) -> String {
+        let size = ((try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber)?.intValue ?? 0
+        if size <= 0 { return "0（文件不可读）" }
+        return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+    }
+
+    /// 找出可用的 tar
+    private func findTar() -> String? {
+        let candidates = ["/var/jb/usr/bin/tar", "/usr/bin/tar", "/var/jb/bin/tar", "/bin/tar"]
+        for c in candidates where FileManager.default.isExecutableFile(atPath: c) {
+            return c
+        }
+        return nil
     }
 
     /// 列出目录结构（用于错误提示）
@@ -313,20 +389,7 @@ struct SDKDownload: View {
 
     /// 用系统 tar 解压（libzip 不支持 tar.gz / tgz），返回是否成功与错误输出
     private func unarchiveTar(_ path: String, to destination: String) -> (Bool, String) {
-        var candidates: [String] = []
-        #if jailbreak
-        candidates = ["/var/jb/usr/bin/tar", "/usr/bin/tar", "/var/jb/bin/tar", "/bin/tar"]
-        #else
-        candidates = ["/usr/bin/tar", "/var/jb/usr/bin/tar", "/bin/tar"]
-        #endif
-
-        let fm = FileManager.default
-        var tarPath: String? = nil
-        for candidate in candidates where fm.isExecutableFile(atPath: candidate) {
-            tarPath = candidate
-            break
-        }
-        guard let tar = tarPath else {
+        guard let tar = findTar() else {
             return (false, "系统里没有找到 tar 命令")
         }
 
