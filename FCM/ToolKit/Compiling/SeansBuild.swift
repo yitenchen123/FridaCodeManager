@@ -273,8 +273,17 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         let unitsFile = "\(ProjectInfo.ProjectPath)/.fcm-units.txt"
         cfile(atPath: unitsFile, withContent: compileUnits.joined(separator: "\n"))
         EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -rf clang && mkdir -p clang ; rm -f " + FAIL_LOG + " ; "
-        EXEC += "JOBS=\$(sysctl -n hw.ncpu 2>/dev/null || echo 4) ; [ \"\$JOBS\" -gt 8 ] && JOBS=8 ; [ \"\$JOBS\" -lt 2 ] && JOBS=2 ; "
-        EXEC += "cat '" + unitsFile + "' | xargs -P \"\$JOBS\" -I {} sh -c '{}' >> " + FAIL_LOG + " ; "
+        // 并行执行脚本单独写成文件，避免在 Swift 字符串里拼 shell 变量
+        let runnerFile = "\(ProjectInfo.ProjectPath)/.fcm-run.sh"
+        // 并行度在 Swift 侧算好，脚本里不出现 shell 变量，避免 Swift 插值冲突
+        var jobs = ProcessInfo.processInfo.activeProcessorCount
+        if jobs > 8 { jobs = 8 }
+        if jobs < 2 { jobs = 2 }
+        let runnerScript = "#!/bin/sh\n"
+            + "cat '" + unitsFile + "' | xargs -P " + String(jobs) + " -I {} sh -c '{}'\n"
+        cfile(atPath: runnerFile, withContent: runnerScript)
+        EXEC += "sh '" + runnerFile + "' >> " + FAIL_LOG + " 2>&1 ; "
+        EXEC += "rm -f '" + runnerFile + "' ; "
         EXEC += "rm -f '" + unitsFile + "' ; "
         EXEC += "mkdir -p '" + info[1] + "' ; "
         EXEC += """
