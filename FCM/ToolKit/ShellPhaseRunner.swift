@@ -135,6 +135,27 @@ private func unescapePBX(_ raw: String) -> String {
 
 // MARK: - 执行
 
+/// 在工程与 App 产物里查找已经准备好的 jar
+/// 用于判断「不必在设备上编译 Java」的场景
+func findPrebuiltJars(projectPath: String) -> [String] {
+    let fm = FileManager.default
+    var found: [String] = []
+
+    let searchDirs = [
+        "\(projectPath)/JavaApp/build",
+        "\(projectPath)/build",
+        "\(projectPath)/Libraries/Jars",
+        "\(projectPath)/java"
+    ]
+    for dir in searchDirs {
+        guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+        for entry in entries where entry.hasSuffix(".jar") {
+            found.append("\(dir)/\(entry)")
+        }
+    }
+    return found.sorted()
+}
+
 /// 按顺序执行脚本阶段，返回是否全部成功
 /// 环境变量尽量对齐 Xcode 的注入，脚本里用 ${SRCROOT} 之类才不会失效
 func runShellBuildPhases(_ phases: [ShellBuildPhase],
@@ -151,9 +172,22 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
     let productsDir = appPath.isEmpty ? buildDir : (appPath as NSString).deletingLastPathComponent
     let targetBuildDir = productsDir
 
+    // 预建脚本阶段常用的产物子目录。
+    // 工程脚本里常写 cp xxx "$BUILT_PRODUCTS_DIR/$TARGET_NAME.app/Java/"，
+    // 如果 Java/ 不存在，cp 会直接失败。
+    // Xcode 在拷贝资源阶段会建好这些目录，FCM 也要提前准备。
+    if !appPath.isEmpty {
+        let appName = (appPath as NSString).lastPathComponent
+        for sub in ["Java", "libs", "java_runtimes", "Frameworks", "Resources"] {
+            cfolder(atPath: "\(appPath)/\(sub)")
+        }
+        _ = appName
+    }
+
     // 探测 JDK：很多工程（如 Air2）的 Makefile 用 BOOTJDK 指定编译器，
     // 实际只要求 javac/jar 可用，字节码版本由 -source 8 -target 8 控制。
     let java = detectJavaToolchain(projectPath: projectPath)
+    let javaToolchainReady = java.ready
     let javaReport = describeJavaToolchain(java)
     for line in javaReport.split(separator: "\n") {
         log("  JDK：" + line)
@@ -166,6 +200,13 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
         log("  兼容处理：\(shim.note)")
     }
 
+    // 检查 Java 产物是否已存在。
+    // iOS 上没有官方 JDK，javac 无法在设备上运行 —— 这是硬限制。
+    // 但如果 jar 已经提前准备好（从 Mac 拷进来 / 从 CI 下载 / 已提交进仓库），
+    // 就不需要再编译，直接跳过 Java 阶段。
+    let existingJars = findPrebuiltJars(projectPath: projectPath)
+    let canSkipJavaBuild = !existingJars.isEmpty
+
     var allSucceeded = true
 
     for (index, phase) in phases.enumerated() {
@@ -174,6 +215,18 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
         // 先探测脚本里有哪些步骤设备上做不了，提前告知
         for warning in detectUnsupportedSteps(phase.script) {
             log("  注意：\(warning)")
+        }
+
+        // 已有 jar 时跳过 Java 编译阶段
+        let phaseLower = (phase.name + phase.script).lowercased()
+        let isJavaBuildPhase = phaseLower.contains("javaapp") || phaseLower.contains("javac")
+            || phaseLower.contains("gradle") || phaseLower.contains("make")
+        if isJavaBuildPhase && canSkipJavaBuild && javaToolchainReady == false {
+            log("  已有预编译 jar，跳过此阶段")
+            for jar in existingJars.prefix(5) {
+                log("    · " + jar)
+            }
+            continue
         }
 
         // 脚本写到文件再执行：内容可能有几十 KB，
@@ -237,9 +290,22 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
                 let trimmed = result.output.count > 1200 ? String(result.output.suffix(1200)) : result.output
                 log(trimmed)
             }
-            allSucceeded = false
-            // 单个脚本失败不中断整个构建：有些阶段是可选的
-            log("  已跳过，继续后续阶段")
+            // 判断这一步是否只影响 Java 侧。
+            // Air2 就是这样：Java 段需要 JDK 才能产出三个 jar，
+            // 但 ObjC/原生部分完全不依赖它。Java 失败不该让原生构建失败。
+            let lower = (phase.name + phase.script).lowercased()
+            let looksJavaOnly = lower.contains("javaapp") || lower.contains("javac")
+                || lower.contains("gradle") || lower.contains("jdk") || lower.contains(".jar")
+            if looksJavaOnly {
+                // Java 阶段失败只降级，不标记整体失败：
+                // 原生部分能编过就应该产出可运行的 ipa（只是缺 Java 功能）
+                log("  这是 Java 相关阶段，失败不阻断原生编译")
+                log("  影响：App.app/Java/ 下会缺 jar，App 启动时可能崩溃")
+                log("  解决：给设备装 JDK（apt install openjdk-17）后重新构建")
+            } else {
+                allSucceeded = false
+                log("  已跳过，继续后续阶段")
+            }
         }
     }
     return allSucceeded
