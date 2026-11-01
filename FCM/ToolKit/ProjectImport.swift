@@ -416,6 +416,32 @@ func importProjectArchive(target: String) -> ImportOutcome {
     return result
 }
 
+/// 把工程目录安装到 Documents 下（每次导入生成新的 UUID 目录，避免冲突）
+private func installProject(from root: String) -> ImportOutcome {
+    let destination = "\(global_documents)/\(UUID())"
+
+    if cp(root, destination) != 0 {
+        _ = rm(destination)
+        return .fail("安装工程失败（复制文件出错）")
+    }
+
+    repairProjectDirectory(destination)
+
+    // 补齐 SDK（导入的工程可能来自别的设备，里面写的 SDK 本地没有）
+    let plist = "\(destination)/Resources/DontTouchMe.plist"
+    let existing = rplist(forKey: "SDK", plistPath: plist) ?? ""
+    let sdkInstalled = !existing.isEmpty &&
+        FileManager.default.fileExists(atPath: "\(global_sdkpath)/\(existing)")
+    if !sdkInstalled {
+        let fallback = UserDefaults.standard.string(forKey: "sdk") ?? "iPhoneOS15.6.sdk"
+        _ = wplist(value: fallback, forKey: "SDK", plistPath: plist)
+    }
+
+    let name = rplist(forKey: "CFBundleExecutable", plistPath: "\(destination)/Resources/Info.plist")
+        ?? "导入的工程"
+    return .success("已导入工程「\(name)」", destination)
+}
+
 /// 把一个已经解压好的暂存目录收编为工程
 func adoptStagedDirectory(_ staging: String) -> ImportOutcome {
     let fm = FileManager.default
