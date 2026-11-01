@@ -66,10 +66,10 @@ struct CommandResult {
 }
 
 /// 执行 shell 命令并捕获输出。绝不静默失败。
-func runCaptured(_ command: String, uid: uid_t = 501, timeout: Int = 900) -> CommandResult {
+func runCaptured(_ command: String, uid: uid_t = 501, env: [String] = [], timeout: Int = 900) -> CommandResult {
     let logPath = "\(global_container)/tmp/fcm-cmd-\(UUID()).log"
     let wrapped = command + " > '" + logPath + "' 2>&1"
-    let code = shell(wrapped, uid: uid, env: [])
+    let code = shell(wrapped, uid: uid, env: env)
     var text = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
     _ = rm(logPath)
     if text.count > 4000 {

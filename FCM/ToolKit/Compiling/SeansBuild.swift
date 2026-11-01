@@ -320,6 +320,35 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     }
     #endif
 
+    // ---------------- 编译 ----------------
+    messenger(status, progress, BuildStage.compile.display, 0.3)
+
+    // 把编译脚本写入文件再执行：Air2 有 200+ 源文件，
+    // 拼成 bash -c 的单个参数会超出 posix_spawn 上限（Failed to spawn process）。
+    let buildScript = "\(global_container)/tmp/fcm-build.sh"
+    _ = rm(buildScript)
+    cfile(atPath: buildScript, withContent: "#!/bin/bash\nset +e\n" + CDEXEC + "\n" + EXEC)
+    shell("chmod +x '" + buildScript + "'", uid: 501, env: [])
+
+    // bashenv 提供 SDKROOT / CPATH / LIBRARY_PATH，缺了会找不到系统头文件和库
+    var compileEnv: [String] = []
+    #if !stock
+    compileEnv = bashenv
+    #endif
+    let compileResult = runCaptured("'" + buildScript + "'", uid: 501, env: compileEnv)
+    _ = rm(buildScript)
+
+    if !compileResult.succeeded {
+        _ = climessenger("compiler-stage", "编译或链接失败")
+        if !compileResult.output.isEmpty {
+            _ = climessenger("compiler-output", compileResult.output)
+        }
+        _ = rm(info[0])
+        _ = rm(info[4])
+        return 1
+    }
+    _ = climessenger("compiler-stage", "编译完成")
+
     // ---------------- 打包 .app ----------------
     messenger(status, progress, BuildStage.bundle.display, 0.45)
 
