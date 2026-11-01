@@ -65,11 +65,14 @@ func detectJavaToolchain(projectPath: String) -> JavaToolchainInfo {
     //   <工程>/.fcm-jdk/            FCM 推荐位置
     //   <工程>/jdk8/                工程自带
     //   Documents/.fcm-jdk/         全局共享
+    // 用户通过「设置 > Java 环境」导入的 JDK 优先；
+    // 其次是工程自带的位置。
     let standardJDKCandidates = [
+        "\(global_documents)/.fcm-jdk",   // FCM 导入的目标位置
         "\(projectPath)/.fcm-jdk",
         "\(projectPath)/jdk8",
         "\(projectPath)/jdk",
-        "\(global_documents)/.fcm-jdk"
+        "\(Bundle.main.bundlePath)/jdk8"  // 若将来内置则可用
     ]
     for candidate in standardJDKCandidates {
         let javac = "\(candidate)/bin/javac"
@@ -82,6 +85,9 @@ func detectJavaToolchain(projectPath: String) -> JavaToolchainInfo {
         info.javacPath = javac
         info.jarPath = fm.isExecutableFile(atPath: "\(candidate)/bin/jar") ? "\(candidate)/bin/jar" : nil
         info.source = isFullJDK ? "标准 JDK（含 tools.jar）" : "JDK 布局"
+        if candidate.hasPrefix(Bundle.main.bundlePath) {
+            info.source += "，随 FCM 内置"
+        }
 
         let versionResult = runCaptured("'\(javac)' -version", uid: 501)
         if let range = versionResult.output.range(of: "javac ") {

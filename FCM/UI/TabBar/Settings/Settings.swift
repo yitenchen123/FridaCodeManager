@@ -69,6 +69,9 @@ struct Settings: View {
                     NavigationLink(destination: Cleaner()) {
                         Label("清理工具", systemImage: "trash.fill")
                     }
+                    NavigationLink(destination: JavaEnvironmentView()) {
+                        Label("Java 环境", systemImage: "cup.and.saucer.fill")
+                    }
                 }
                 NavigationLink(destination: ExperimentalSettingsBundle()) {
                     Label("实验性功能", systemImage: "exclamationmark.triangle.fill")
