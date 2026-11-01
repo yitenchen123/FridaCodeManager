@@ -196,3 +196,60 @@ func collectIOSStaticLibraries(projectPath: String, ignorePrefixes: [String]) ->
     }
     return result.sorted()
 }
+
+/// 直接读取文件头的 CPU 类型（单个 Mach-O 或 Fat）
+func machoPlatformOnly(_ path: String) -> String? {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { handle.closeFile() }
+    let head = handle.readData(ofLength: 8)
+    guard head.count == 8 else { return nil }
+    let b = [UInt8](head)
+
+    if b[0] == 0xCA && b[1] == 0xFE && b[2] == 0xBA && b[3] == 0xBE {
+        return fatBinaryPlatforms(path)
+    }
+    if b[0] == 0xCF && b[1] == 0xFA && b[2] == 0xED && b[3] == 0xFE {
+        let cpu = UInt32(b[4]) | (UInt32(b[5]) << 8) | (UInt32(b[6]) << 16) | (UInt32(b[7]) << 24)
+        switch cpu {
+        case 0x0100000C: return "arm64"
+        case 0x0000000C: return "armv7"
+        case 0x01000007: return "x86_64"
+        default: return nil
+        }
+    }
+    return nil
+}
+
+/// 收集可用的 .framework 及其二进制路径（只收 arm64 的）
+func collectIOSFrameworks(projectPath: String, ignorePrefixes: [String]) -> [(name: String, path: String)] {
+    let fm = FileManager.default
+    guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else { return [] }
+    let ignoreSet = Set(ignorePrefixes.filter { !$0.isEmpty })
+
+    var seen = Set<String>()
+    var result: [(String, String)] = []
+
+    for entry in all where entry.hasSuffix(".framework") {
+        if ignoreSet.contains(where: { entry.hasPrefix($0) }) { continue }
+        if pathHasForeignPlatform(entry) { continue }
+
+        let frameworkPath = "\(projectPath)/\(entry)"
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: frameworkPath, isDirectory: &isDir), isDir.boolValue else { continue }
+
+        let name = ((entry as NSString).lastPathComponent as NSString).deletingPathExtension
+        if seen.contains(name) { continue }
+
+        let binary = "\(frameworkPath)/\(name)"
+        guard fm.fileExists(atPath: binary) else { continue }
+
+        // 只收 arm64 / armv7 的
+        if let platform = machoPlatformOnly(binary),
+           platform != "arm64" && platform != "armv7" {
+            continue
+        }
+        seen.insert(name)
+        result.append((name, binary))
+    }
+    return result.sorted { $0.0 < $1.0 }
+}

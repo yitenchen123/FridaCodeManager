@@ -197,7 +197,17 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     //finding frameworks
     messenger(status,progress,"finding frameworks", 0.15)
     let frameworks = !MFiles.isEmpty && FileManager.default.fileExists(atPath: info[3]) ? findFrameworks(in: URL(fileURLWithPath: ProjectInfo.ProjectPath), SDKPath: info[3], ignorePaths: splitAndTrim(apiextension.ign) + ["Resources"]) : []
-    let frameflags = frameworks.map { "-framework \($0)" }.joined(separator: " ")
+    // 工程自带的 .framework（如 terracotta）：需要额外传 -F 搜索路径，
+    // 否则符号会缺失（_terracotta_ios_* 之类）。
+    let localFrameworks = collectIOSFrameworks(projectPath: ProjectInfo.ProjectPath,
+                                               ignorePrefixes: splitAndTrim(apiextension.ign) + ["Resources"])
+    var localFrameworkFlags = ""
+    for item in localFrameworks {
+        let fwDir = ((item.path as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
+        localFrameworkFlags += " -F'" + fwDir + "' -framework " + item.name
+    }
+
+    let frameflags = (frameworks.map { "-framework \($0)" }.joined(separator: " ") + localFrameworkFlags)
 
     //setting up command
     messenger(status,progress,"setting up compiler",0.2)
@@ -230,6 +240,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     let Q = String(Character(Unicode.Scalar(34)))
     // 失败文件名写入该文件，避免在 Swift 字符串里拼接 shell 变量（$ 会被当成插值）
     let FAIL_LOG = quoted(ProjectInfo.ProjectPath, "fcm-failed-files.txt")
+    let LINK_FLAG = quoted(ProjectInfo.ProjectPath, "fcm-link-failed.txt")
     var EXEC = ""
     if !SwiftFiles.isEmpty {
         #if jailbreak
@@ -286,7 +297,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
                     "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) -c ",
                     quoted(ProjectInfo.ProjectPath, unit.source),
                     " -o ", quoted(ProjectInfo.ProjectPath, "./clang/" + (unit.object as NSString).lastPathComponent),
-                    " 2>/dev/null || echo ", Q, unit.source, Q
+                    " 2>&1 || echo ", Q, "FAILED: " + unit.source, Q
                     ].joined()
             }
             let unitsFile = "\(ProjectInfo.ProjectPath)/.fcm-units.txt"
@@ -299,7 +310,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
             cfile(atPath: runnerFile, withContent:
                 "#!/bin/sh\ncat '" + unitsFile + "' | xargs -P " + String(jobs) + " -I {} sh -c '{}'\n")
 
-            EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -f " + FAIL_LOG + " ; "
+            EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -f " + FAIL_LOG + " '" + LINK_FLAG + "' ; "
             EXEC += "sh '" + runnerFile + "' >> " + FAIL_LOG + " 2>&1 ; "
             EXEC += "rm -f '" + runnerFile + "' '" + unitsFile + "' ; "
         } else {
@@ -309,10 +320,13 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         // 链接：收集所有 .o（含复用的）
         EXEC += "mkdir -p '" + info[1] + "' ; "
         EXEC += """
-        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, AFiles)) clang/*.o -o '\(info[1])/\(ProjectInfo.Executable)'
+        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, AFiles)) clang/*.o -o '\(info[1])/\(ProjectInfo.Executable)' || echo "LINK_FAILED" > '" + LINK_FLAG + "'
         """
         EXEC += " ; "
-        EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '以下文件编译失败：'; cat " + FAIL_LOG + "; exit 1; fi"
+        // 编译失败与链接失败分开报告，避免把链接错误说成"这些文件编译失败"
+        EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '以下文件编译失败：'; cat " + FAIL_LOG + "; fi ; "
+        EXEC += "if [ -f '" + LINK_FLAG + "' ]; then echo '链接失败，请查看上面的 ld 输出'; rm -f '" + LINK_FLAG + "' ; exit 1 ; fi ; "
+        EXEC += "if [ -s " + FAIL_LOG + " ]; then exit 1 ; fi"
         #elseif trollstore
         EXEC += """
         clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, MFiles)) \(quotedList(ProjectInfo.ProjectPath, AFiles)) \
@@ -353,6 +367,14 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         _ = climessenger("static-libs", libReport)
     } else {
         _ = climessenger("static-libs", "工程内没有可用的 iOS 静态库")
+    }
+
+    if !localFrameworks.isEmpty {
+        var fwReport = "工程自带 framework \(localFrameworks.count) 个："
+        for item in localFrameworks {
+            fwReport += "\n  " + item.name + "  (" + item.path.replacingOccurrences(of: ProjectInfo.ProjectPath + "/", with: "") + ")"
+        }
+        _ = climessenger("local-frameworks", fwReport)
     }
 
     // ---------------- 编译 ----------------
