@@ -226,15 +226,25 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         objcFlags = ""
     }
 
+    // 双引号常量：直接写转义引号在多层的 Swift 字符串里极易出错，统一用 Q
+    let Q = String(Character(Unicode.Scalar(34)))
+    // 失败文件名写入该文件，避免在 Swift 字符串里拼接 shell 变量（$ 会被当成插值）
+    let FAIL_LOG = quoted(ProjectInfo.ProjectPath, "fcm-failed-files.txt")
     var EXEC = ""
     if !SwiftFiles.isEmpty {
         #if jailbreak
         if !MFiles.isEmpty {
             // shell() 用 bash -e 执行，任何一条 clang 返回非 0 都会让脚本立刻退出。
             // 所以每条命令都用 || 记录失败文件名，全部跑完再统一判定。
-            EXEC += #"FAILFILE=""; "#
+            EXEC += "rm -f " + FAIL_LOG + " ; "
             EXEC += MFiles.map { mFile in
-                "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build_sub) -target arm64-apple-ios\(ProjectInfo.TG) -c \(quoted(ProjectInfo.ProjectPath, mFile)) \(AFiles.joined(separator: " ")) -o '\(info[4])/\(UUID()).o' || FAILFILE=\"\$FAILFILE \(mFile)\" ; "
+                [
+                "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build_sub) -target arm64-apple-ios\(ProjectInfo.TG) -c ",
+                quoted(ProjectInfo.ProjectPath, mFile),
+                " ", AFiles.joined(separator: " "),
+                " -o '", info[4], "/", UUID().uuidString, ".o' || ",
+                "echo ", Q, mFile, Q, " >> " + FAIL_LOG
+                ].joined()
             }.joined()
         }
         EXEC += """
@@ -242,7 +252,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         \(FileManager.default.fileExists(atPath: info[5]) ? "-import-objc-header '\(info[5])'" : "") -parse-as-library -target arm64-apple-ios\(ProjectInfo.TG) -o '\(info[1])/\(ProjectInfo.Executable)'
         """
         EXEC += " || true ; "
-        EXEC += #"if [ -n "$FAILFILE" ]; then echo '以下文件编译失败：'; echo "$FAILFILE"; exit 1; fi"#
+        EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '以下文件编译失败：'; cat " + FAIL_LOG + "; exit 1; fi"
         #elseif trollstore
         print("TrollStore 版本目前不支持 Swift 工程！\n")
         return 1
@@ -252,15 +262,20 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         // 纯 ObjC 工程：逐文件编译，单文件失败不中断，
         // 否则 239 个文件里任何一个出错都会整体中止且不打印 error。
         EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -rf clang && mkdir -p clang ; "
-        EXEC += #"FAILFILE=""; "#
+        EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -f " + FAIL_LOG + " ; "
         EXEC += MFiles.map { mFile in
-            "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) -c \(quoted(ProjectInfo.ProjectPath, mFile)) -o 'clang/\(UUID()).o' || FAILFILE=\"\$FAILFILE \(mFile)\" ; "
+            [
+                "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) -c ",
+                quoted(ProjectInfo.ProjectPath, mFile),
+                " -o 'clang/", UUID().uuidString, ".o' || ",
+                "echo ", Q, mFile, Q, " >> " + FAIL_LOG
+                ].joined()
         }.joined()
         EXEC += """
         clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, AFiles)) clang/*.o -o '\(info[1])/\(ProjectInfo.Executable)'
         """
         EXEC += " ; "
-        EXEC += #"if [ -n "$FAILFILE" ]; then echo '以下文件编译失败：'; echo "$FAILFILE"; exit 1; fi"#
+        EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '以下文件编译失败：'; cat " + FAIL_LOG + "; exit 1; fi"
         #elseif trollstore
         EXEC += """
         clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, MFiles)) \(quotedList(ProjectInfo.ProjectPath, AFiles)) \
