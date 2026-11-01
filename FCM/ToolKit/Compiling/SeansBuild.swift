@@ -32,6 +32,18 @@ import Foundation
 import SwiftUI
 import Darwin
 
+/// 把工程路径与相对路径拼成一个安全的 shell 参数（整体加单引号）
+func quoted(_ base: String, _ relative: String) -> String {
+    let full = (base as NSString).appendingPathComponent(relative)
+    let escaped = full.replacingOccurrences(of: "'", with: "'\\''")
+    return "'" + escaped + "'"
+}
+
+/// 把相对路径数组转成空格分隔的带引号参数
+func quotedList(_ base: String, _ items: [String]) -> String {
+    return items.map { quoted(base, $0) }.joined(separator: " ")
+}
+
 /// 扫描工程内的头文件搜索路径
 /// Xcode 用 HEADER_SEARCH_PATHS 指定这些目录，FCM 之前完全没有传，
 /// 导致 #import "a2_log.h"（在别的目录）和 #include <jni.h> 必然找不到。
@@ -219,11 +231,11 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         #if jailbreak
         if !MFiles.isEmpty {
             EXEC += MFiles.map { mFile in
-                "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build_sub) -target arm64-apple-ios\(ProjectInfo.TG) -c '\(ProjectInfo.ProjectPath)/\(mFile)' \(AFiles.joined(separator: " ")) -o '\(info[4])/\(UUID()).o' ; "
+                "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build_sub) -target arm64-apple-ios\(ProjectInfo.TG) -c \(quoted(ProjectInfo.ProjectPath, mFile)) \(AFiles.joined(separator: " ")) -o '\(info[4])/\(UUID()).o' ; "
             }.joined()
         }
         EXEC += """
-        swiftc -D\(ProjectInfo.Macro) \(SwiftFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \(AFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \(MFiles.isEmpty ? "" : "clang/*.o") \(apiextension.build) \
+        swiftc -D\(ProjectInfo.Macro) \(quotedList(ProjectInfo.ProjectPath, SwiftFiles)) \(quotedList(ProjectInfo.ProjectPath, AFiles)) \(MFiles.isEmpty ? "" : "clang/*.o") \(apiextension.build) \
         \(FileManager.default.fileExists(atPath: info[5]) ? "-import-objc-header '\(info[5])'" : "") -parse-as-library -target arm64-apple-ios\(ProjectInfo.TG) -o '\(info[1])/\(ProjectInfo.Executable)'
         """
         #elseif trollstore
@@ -233,12 +245,12 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     } else {
         #if jailbreak
         EXEC += """
-        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(MFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \(AFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \
+        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, MFiles)) \(quotedList(ProjectInfo.ProjectPath, AFiles)) \
         -o '\(info[1])/\(ProjectInfo.Executable)'
         """
         #elseif trollstore
         EXEC += """
-        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(MFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \(AFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \
+        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, MFiles)) \(quotedList(ProjectInfo.ProjectPath, AFiles)) \
         -o '\(info[1])/\(ProjectInfo.Executable)'
         """
         #endif
@@ -300,7 +312,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     dyunlock();
     //MachO!!
     let ofiles = FindFilesStack(ProjectInfo.ProjectPath, [".o"], splitAndTrim(apiextension.ign) + ["Resources"])
-    if dyexec("\(Bundle.main.bundlePath)/toolchain/bin/ld.dylib", "ld -ObjC -lc -lc++ \(ofiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) -syslibroot \(info[3]) \(frameflags) -o \(info[1])/\(ProjectInfo.Executable)") != 0 {
+    if dyexec("\(Bundle.main.bundlePath)/toolchain/bin/ld.dylib", "ld -ObjC -lc -lc++ \(quotedList(ProjectInfo.ProjectPath, ofiles)) -syslibroot \(info[3]) \(frameflags) -o \(info[1])/\(ProjectInfo.Executable)") != 0 {
         print("[!] 链接失败！\n")
         _ = rm(info[0])
         _ = rm(info[4])

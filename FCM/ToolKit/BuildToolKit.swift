@@ -79,11 +79,10 @@ func FindFilesStack(_ projectPath: String, _ fileExtensions: [String], _ ignore:
         for file in allFiles {
             if fileExtensionsSet.contains(where: { file.hasSuffix($0) }) &&
                !ignoreSet.contains(where: { file.hasPrefix($0) }) {
-                #if !stock
-                objCFiles.append("'\(file)'")
-                #else
-                objCFiles.append("\(file)")
-                #endif
+                // 这里只返回相对路径，引号统一在拼接命令时加，
+                // 否则会出现 /工程路径/'相对路径' 这种把引号包在中间的写法，
+                // clang 会把 '文件名' 当成目录名，导致编译中断。
+                objCFiles.append(file)
             }
         }
         return objCFiles
