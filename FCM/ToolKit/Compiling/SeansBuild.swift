@@ -217,6 +217,25 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     // Xcode 工程里的 OTHER_LDFLAGS 直接透传：
     // 例如 "-Wl,-U,_terracotta_ios_start" 表示允许该符号未定义（运行时解析），
     // 以及 -L<path> -lmbedtls 这类库搜索与链接参数。
+    // 优先读取 .xcodeproj 里的真实构建设置。
+    // Xcode 用 HEADER_SEARCH_PATHS / OTHER_LDFLAGS 精确控制编译，
+    // 靠扫描目录猜测必然对不上，这是之前链路反复失败的根因。
+    let xcodeConfig = loadXcodeBuildConfig(projectPath: ProjectInfo.ProjectPath)
+    var headerFlags = ""
+    if xcodeConfig.sourceFound && !xcodeConfig.headerSearchPaths.isEmpty {
+        headerFlags = clangIncludeFlags(from: xcodeConfig)
+        var report = "读取 Xcode 工程配置：头文件路径 \(xcodeConfig.headerSearchPaths.count) 个"
+        report += "，链接参数 \(xcodeConfig.otherLDFlags.count) 条"
+        _ = climessenger("xcode-config", report)
+        for path in xcodeConfig.headerSearchPaths.prefix(10) {
+            _ = climessenger("xcode-config", "  -I " + path.replacingOccurrences(of: ProjectInfo.ProjectPath + "/", with: ""))
+        }
+    } else {
+        // 没有工程配置时退回目录扫描
+        headerFlags = discoverHeaderPaths(ProjectInfo.ProjectPath)
+        _ = climessenger("xcode-config", "未找到 .xcodeproj 配置，改用目录扫描")
+    }
+
     let xcodeLinkFlags = clangLinkFlags(from: xcodeConfig)
     let defineFlags = clangDefineFlags(from: xcodeConfig)
 
@@ -245,25 +264,6 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
 
     //setting up command
     messenger(status,progress,"setting up compiler",0.2)
-
-    // 优先读取 .xcodeproj 里的真实构建设置。
-    // Xcode 用 HEADER_SEARCH_PATHS / OTHER_LDFLAGS 精确控制编译，
-    // 靠扫描目录猜测必然对不上，这是之前链路反复失败的根因。
-    let xcodeConfig = loadXcodeBuildConfig(projectPath: ProjectInfo.ProjectPath)
-    var headerFlags = ""
-    if xcodeConfig.sourceFound && !xcodeConfig.headerSearchPaths.isEmpty {
-        headerFlags = clangIncludeFlags(from: xcodeConfig)
-        var report = "读取 Xcode 工程配置：头文件路径 \(xcodeConfig.headerSearchPaths.count) 个"
-        report += "，链接参数 \(xcodeConfig.otherLDFlags.count) 条"
-        _ = climessenger("xcode-config", report)
-        for path in xcodeConfig.headerSearchPaths.prefix(10) {
-            _ = climessenger("xcode-config", "  -I " + path.replacingOccurrences(of: ProjectInfo.ProjectPath + "/", with: ""))
-        }
-    } else {
-        // 没有工程配置时退回目录扫描
-        headerFlags = discoverHeaderPaths(ProjectInfo.ProjectPath)
-        _ = climessenger("xcode-config", "未找到 .xcodeproj 配置，改用目录扫描")
-    }
 
     // 现代 Objective-C 基本都用 ARC；不开 ARC 时任何 __weak 都会直接报错
     // （cannot create __weak reference in file using manual reference counting）。
@@ -332,12 +332,14 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         if !pending.isEmpty {
             let errorDir = "\(ProjectInfo.ProjectPath)/.fcm-errors"
             let compileUnits = pending.map { unit in
-                let errFile = errorDir + "/" + (unit.object as NSString).lastPathComponent + ".txt"
+                // 错误日志按 .o 名区分；失败时把源文件写进汇总清单，
+                // 具体 error 行由脚本末尾从各自的日志里提取。
+                let errName = (unit.object as NSString).lastPathComponent + ".txt"
                 return [
                     "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) -c ",
                     quoted(ProjectInfo.ProjectPath, unit.source),
                     " -o ", quoted(ProjectInfo.ProjectPath, "./clang/" + (unit.object as NSString).lastPathComponent),
-                    " > ", quoted(ProjectInfo.ProjectPath, "./.fcm-errors/" + (unit.object as NSString).lastPathComponent + ".txt"),
+                    " > ", quoted(ProjectInfo.ProjectPath, "./.fcm-errors/" + errName),
                     " 2>&1 || echo ", Q, unit.source, Q
                     ].joined()
             }

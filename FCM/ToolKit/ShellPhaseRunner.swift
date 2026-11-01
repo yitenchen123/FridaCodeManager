@@ -144,7 +144,6 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
                          log: (String) -> Void) -> Bool {
     guard !phases.isEmpty else { return true }
 
-    let fm = FileManager.default
     let buildDir = "\(global_container)/tmp/fcm-build-dir"
     cfolder(atPath: buildDir)
 
