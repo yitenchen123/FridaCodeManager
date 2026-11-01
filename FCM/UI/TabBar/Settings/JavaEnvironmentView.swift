@@ -36,10 +36,9 @@ struct JavaEnvironmentView: View {
         List {
             Section(header: Text("当前环境")) {
                 if info.ready {
-                    LabeledContent("版本", value: info.version.isEmpty ? "未知" : info.version)
-                    LabeledContent("来源", value: info.source)
-                    LabeledContent("Java 8 目标",
-                                   value: info.supportsJava8Target ? "支持" : "不支持")
+                    infoRow("版本", info.version.isEmpty ? "未知" : info.version)
+                    infoRow("来源", info.source)
+                    infoRow("Java 8 目标", info.supportsJava8Target ? "支持" : "不支持")
                     if let home = info.home {
                         Text(home)
                             .font(.caption)
@@ -92,6 +91,17 @@ struct JavaEnvironmentView: View {
                       allowedContentTypes: [.zip, .archive],
                       allowsMultipleSelection: false,
                       onCompletion: handleImport)
+    }
+
+    /// iOS 15 兼容的行布局（LabeledContent 需要 iOS 16）
+    private func infoRow(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.trailing)
+        }
     }
 
     // MARK: - 状态
