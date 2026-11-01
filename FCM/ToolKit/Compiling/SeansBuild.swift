@@ -482,6 +482,25 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     // ---------------- 打包 .app ----------------
     messenger(status, progress, BuildStage.bundle.display, 0.45)
 
+    // 可执行文件名遵循 Xcode 规则：
+    //   EXECUTABLE_NAME = PRODUCT_NAME（去掉 $(...) 变量）
+    //   实际文件 = EXECUTABLE_PREFIX + EXECUTABLE_NAME + EXECUTABLE_SUFFIX
+    var executableName = ProjectInfo.Executable
+    if !xcodeConfig.productName.isEmpty {
+        let resolved = xcodeConfig.productName
+            .replacingOccurrences(of: "$(TARGET_NAME)", with: ProjectInfo.Executable)
+            .replacingOccurrences(of: "$(PRODUCT_NAME)", with: ProjectInfo.Executable)
+            .replacingOccurrences(of: "${TARGET_NAME}", with: ProjectInfo.Executable)
+            .trimmingCharacters(in: .whitespaces)
+        if !resolved.isEmpty && !resolved.contains("$(") {
+            executableName = resolved
+        }
+    }
+    let finalExecutable = xcodeConfig.executablePrefix + executableName + xcodeConfig.executableSuffix
+    if finalExecutable != ProjectInfo.Executable {
+        _ = climessenger("build-plan", "可执行文件名：\(finalExecutable)（依据 PRODUCT_NAME）")
+    }
+
     let stagingApp = info[1]
     _ = rm(stagingApp)
     cfolder(atPath: stagingApp)
@@ -547,6 +566,31 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         return 1
     }
     _ = climessenger("sign-stage", "签名完成：\(ProjectInfo.Executable)")
+
+    // ---------------- 剥离符号 ----------------
+    // Xcode: STRIP_INSTALLED_PRODUCT=YES 时对产物执行 strip
+    // STRIP_STYLE 决定剥离哪些符号：all / non-global / debugging
+    if xcodeConfig.stripInstalledProduct {
+        let stripStyle = xcodeConfig.stripStyle.isEmpty ? "all" : xcodeConfig.stripStyle
+        var stripFlag = "-x"
+        switch stripStyle {
+        case "all": stripFlag = "-x"
+        case "non-global": stripFlag = "-x"
+        case "debugging": stripFlag = "-S"
+        default: stripFlag = "-x"
+        }
+        // iOS 上不一定有 strip 命令，没有就跳过（不影响产物可用性）
+        let hasStrip = ["/var/jb/usr/bin/strip", "/usr/bin/strip"]
+            .contains { FileManager.default.isExecutableFile(atPath: $0) }
+        let stripResult = hasStrip
+            ? runCaptured("strip \(stripFlag) '\(executablePath)' 2>&1", uid: 501)
+            : CommandResult(code: -1, output: "设备上没有 strip 命令，已跳过")
+        if stripResult.succeeded {
+            _ = climessenger("strip-stage", "已剥离符号（\(stripStyle)），大小：\(readableSize(executablePath))")
+        } else {
+            _ = climessenger("strip-stage", "剥离失败（不影响运行）：\(stripResult.output)")
+        }
+    }
 
     // ---------------- 校验产物 ----------------
     messenger(status, progress, BuildStage.verify.display, 0.65)

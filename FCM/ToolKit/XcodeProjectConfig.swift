@@ -48,6 +48,22 @@ struct XcodeBuildConfig {
     var strictObjCMsgSend: Bool = false
     var runpathSearchPaths: [String] = []
     var supportedPlatforms: String = ""
+    // 以下依据 Apple Build Settings Reference 补齐
+    var userHeaderSearchPaths: [String] = []      // USER_HEADER_SEARCH_PATHS → -iquote
+    var systemHeaderSearchPaths: [String] = []    // SYSTEM_HEADER_SEARCH_PATHS → -isystem
+    var systemFrameworkSearchPaths: [String] = [] // SYSTEM_FRAMEWORK_SEARCH_PATHS
+    var cxxLanguageStandard: String = ""          // CLANG_CXX_LANGUAGE_STANDARD
+    var productName: String = ""                  // PRODUCT_NAME
+    var executablePrefix: String = ""             // EXECUTABLE_PREFIX
+    var executableSuffix: String = ""             // EXECUTABLE_SUFFIX
+    var architectures: String = ""                // ARCHS
+    var validArchs: String = ""                   // VALID_ARCHS
+    var onlyActiveArch: Bool = false              // ONLY_ACTIVE_ARCH
+    var stripInstalledProduct: Bool = false       // STRIP_INSTALLED_PRODUCT
+    var stripStyle: String = ""                   // STRIP_STYLE
+    var debugInformationFormat: String = ""       // DEBUG_INFORMATION_FORMAT
+    var codeSignEntitlements: String = ""         // CODE_SIGN_ENTITLEMENTS
+    var resourcesFolderPath: String = ""          // UNLOCALIZED_RESOURCES_FOLDER_PATH
     var sourceFound: Bool = false
 }
 
@@ -94,6 +110,21 @@ func loadXcodeBuildConfig(projectPath: String) -> XcodeBuildConfig {
     config.runpathSearchPaths = parseListSetting("LD_RUNPATH_SEARCH_PATHS", in: text, projectPath: projectPath)
     config.strictObjCMsgSend = parseBoolSetting("ENABLE_STRICT_OBJC_MSGSEND", in: text, defaultValue: false)
     config.generateInfoPlist = parseBoolSetting("GENERATE_INFOPLIST_FILE", in: text, defaultValue: true)
+
+    config.userHeaderSearchPaths = parseListSetting("USER_HEADER_SEARCH_PATHS", in: text, projectPath: projectPath)
+    config.systemHeaderSearchPaths = parseListSetting("SYSTEM_HEADER_SEARCH_PATHS", in: text, projectPath: projectPath)
+    config.systemFrameworkSearchPaths = parseListSetting("SYSTEM_FRAMEWORK_SEARCH_PATHS", in: text, projectPath: projectPath)
+    config.cxxLanguageStandard = parseStringSetting("CLANG_CXX_LANGUAGE_STANDARD", in: text, projectPath: projectPath)
+    config.productName = parseStringSetting("PRODUCT_NAME", in: text, projectPath: projectPath)
+    config.executablePrefix = parseStringSetting("EXECUTABLE_PREFIX", in: text, projectPath: projectPath)
+    config.executableSuffix = parseStringSetting("EXECUTABLE_SUFFIX", in: text, projectPath: projectPath)
+    config.architectures = parseStringSetting("ARCHS", in: text, projectPath: projectPath)
+    config.validArchs = parseStringSetting("VALID_ARCHS", in: text, projectPath: projectPath)
+    config.onlyActiveArch = parseBoolSetting("ONLY_ACTIVE_ARCH", in: text, defaultValue: false)
+    config.stripInstalledProduct = parseBoolSetting("STRIP_INSTALLED_PRODUCT", in: text, defaultValue: false)
+    config.stripStyle = parseStringSetting("STRIP_STYLE", in: text, projectPath: projectPath)
+    config.debugInformationFormat = parseStringSetting("DEBUG_INFORMATION_FORMAT", in: text, projectPath: projectPath)
+    config.codeSignEntitlements = parseStringSetting("CODE_SIGN_ENTITLEMENTS", in: text, projectPath: projectPath)
     config.productBundleIdentifier = parseStringSetting("PRODUCT_BUNDLE_IDENTIFIER", in: text, projectPath: projectPath)
     config.deploymentTarget = parseStringSetting("IPHONEOS_DEPLOYMENT_TARGET", in: text, projectPath: projectPath)
 
@@ -314,11 +345,24 @@ func isValidShellArgument(_ value: String) -> Bool {
 func clangIncludeFlags(from config: XcodeBuildConfig) -> String {
     var flags = ""
     var seen = Set<String>()
+
+    // -iquote：用户头文件优先（#import "xxx.h"）
+    for path in config.userHeaderSearchPaths where !seen.contains(path) {
+        guard isValidShellArgument(path) else { continue }
+        seen.insert(path)
+        flags += " -iquote" + shellQuote(path)
+    }
+    // -I：常规头文件搜索
     for path in config.headerSearchPaths where !seen.contains(path) {
-        // 过滤掉解析残留，宁可少一个 -I 也不让整条命令语法错误
         guard isValidShellArgument(path) else { continue }
         seen.insert(path)
         flags += " -I" + shellQuote(path)
+    }
+    // -isystem：系统头（不产生警告）
+    for path in config.systemHeaderSearchPaths where !seen.contains(path) {
+        guard isValidShellArgument(path) else { continue }
+        seen.insert(path)
+        flags += " -isystem" + shellQuote(path)
     }
     return flags
 }
@@ -331,6 +375,10 @@ func clangLinkFlags(from config: XcodeBuildConfig) -> String {
     }
     for path in config.frameworkSearchPaths {
         flags += " -F" + shellQuote(path)
+    }
+    for path in config.systemFrameworkSearchPaths {
+        guard isValidShellArgument(path) else { continue }
+        flags += " -iframework" + shellQuote(path)
     }
     for raw in config.otherLDFlags {
         // Xcode 里写的是 "-Wl,-U,_sym" 这种形式，去掉外层引号即可直接用
@@ -359,6 +407,12 @@ func clangCodegenFlags(from config: XcodeBuildConfig) -> String {
     if !config.optimizationLevel.isEmpty {
         let level = config.optimizationLevel.trimmingCharacters(in: .whitespaces)
         if !level.isEmpty { flags += " -O" + level }
+    }
+
+    // C++ 语言标准：gnu++17 → -std=gnu++17
+    if !config.cxxLanguageStandard.isEmpty {
+        let cxx = config.cxxLanguageStandard.trimmingCharacters(in: .whitespaces)
+        if !cxx.isEmpty { flags += " -Xclang -std=" + cxx }
     }
 
     // 严格 objc msgSend 检查会插入额外检查，设备上关闭可减少运行时开销
