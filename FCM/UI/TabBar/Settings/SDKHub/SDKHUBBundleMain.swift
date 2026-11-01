@@ -189,42 +189,17 @@ struct SDKDownload: View {
         case .success(let urls):
             guard let fileURL = urls.first else { return }
             downloading = "local"
-            status = "正在导入 SDK…"
+            status = "正在读取文件…"
+
             DispatchQueue.global(qos: .userInitiated).async {
-                let scope = fileURL.startAccessingSecurityScopedResource()
-                let staged = "\(global_container)/tmp/sdk-import-\(UUID())"
-                cfolder(atPath: staged)
-                var ok = libzip_unzip(fileURL.path, staged) == 0
-
-                // libzip 不认 tar 系列，用系统 tar 兜底（rootless 下 tar 在 /var/jb/usr/bin）
-                if !ok {
-                    ok = unarchiveTar(fileURL.path, to: staged)
-                }
-                if !ok {
-                    // 有些包换了后缀，直接嗅探文件头
-                    ok = looksLikeTarball(fileURL.path) && unarchiveTar(fileURL.path, to: staged)
-                }
-                if scope { fileURL.stopAccessingSecurityScopedResource() }
-
-                var found: [String] = []
-                if ok {
-                    found = collectSDKs(in: staged)
-                }
-                _ = rm(staged)
-
+                let outcome = importSDKFile(fileURL)
                 DispatchQueue.main.async {
                     downloading = nil
                     refreshInstalled()
                     listid = UUID()
-                    if found.isEmpty {
-                        status = ""
-                        haptfeedback(2)
-                        showAlert(with: "导入失败：压缩包里没有找到 iPhoneOS*.sdk 目录\n\n支持的格式：zip、tar.gz / tgz")
-                    } else {
-                        status = "已导入：\(found.joined(separator: "、"))"
-                        haptfeedback(1)
-                        showAlert(with: "已导入 SDK：\n" + found.joined(separator: "\n"))
-                    }
+                    haptfeedback(outcome.ok ? 1 : 2)
+                    status = outcome.ok ? outcome.message : ""
+                    showAlert(with: outcome.message)
                 }
             }
         case .failure(let error):
@@ -232,6 +207,76 @@ struct SDKDownload: View {
             status = ""
             showAlert(with: "导入失败：\(error.localizedDescription)")
         }
+    }
+
+    /// 同步执行整个导入流程，返回可展示的结果（包含失败的具体原因）
+    private func importSDKFile(_ fileURL: URL) -> (ok: Bool, message: String) {
+        let fm = FileManager.default
+        cfolder(atPath: "\(global_container)/tmp")
+
+        // 1) 复制到自己的沙盒（fileImporter 给的 URL 可能随授权结束失效）
+        //    用 copyItem 而不是读进内存，避免大包 OOM
+        let scope = fileURL.startAccessingSecurityScopedResource()
+        let local = "\(global_container)/tmp/sdk-src-\(UUID()).bin"
+        var copied = false
+        do {
+            try fm.copyItem(at: fileURL, to: URL(fileURLWithPath: local))
+            copied = true
+        } catch {
+            // 同一个文件系统内可能不支持 copy，退回硬链接/直接读路径
+            copied = (cp(fileURL.path, local) == 0)
+        }
+        if scope { fileURL.stopAccessingSecurityScopedResource() }
+        let source = copied ? local : fileURL.path
+        defer { if copied { _ = rm(local) } }
+
+        guard fm.fileExists(atPath: source) else {
+            return (false, "无法读取该文件，请重新选择")
+        }
+
+        // 2) 解压：先 zip，再 tar
+        let staged = "\(global_container)/tmp/sdk-import-\(UUID())"
+        cfolder(atPath: staged)
+        defer { _ = rm(staged) }
+
+        var extractError = ""
+        let zipResult = libzip_unzip(source, staged)
+        if zipResult != 0 {
+            let (ok, log) = unarchiveTar(source, to: staged)
+            if !ok {
+                extractError = log.isEmpty ? "无法识别压缩格式" : log
+            }
+        }
+
+        // 3) 找 SDK
+        let found = collectSDKs(in: staged)
+        if found.isEmpty {
+            // 把目录结构带出来，方便判断到底是解压失败还是结构不符
+            let listing = describeTree(staged, limit: 12)
+            var msg = "导入失败：压缩包里没有找到 iPhoneOS*.sdk 目录\n\n"
+            if !extractError.isEmpty {
+                msg += "解压错误：\(extractError)\n\n"
+            }
+            msg += "解压后的内容：\n\(listing)"
+            return (false, msg)
+        }
+        return (true, "已导入 SDK：\n" + found.joined(separator: "\n"))
+    }
+
+    /// 列出目录结构（用于错误提示）
+    private func describeTree(_ path: String, limit: Int) -> String {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: path), !entries.isEmpty else {
+            return "（空目录）"
+        }
+        var lines: [String] = []
+        for name in entries.prefix(limit) {
+            var isDir: ObjCBool = false
+            fm.fileExists(atPath: "\(path)/\(name)", isDirectory: &isDir)
+            lines.append(isDir.boolValue ? "\(name)/" : name)
+        }
+        if entries.count > limit { lines.append("…（共 \(entries.count) 项）") }
+        return lines.joined(separator: "\n")
     }
 
     /// 在解压目录里找出 SDK（可能多套一层，也可能是没有版本号的 iPhoneOS.sdk）
@@ -266,13 +311,13 @@ struct SDKDownload: View {
         return results
     }
 
-    /// 用系统 tar 解压（libzip 不支持 tar.gz / tgz）
-    private func unarchiveTar(_ path: String, to destination: String) -> Bool {
+    /// 用系统 tar 解压（libzip 不支持 tar.gz / tgz），返回是否成功与错误输出
+    private func unarchiveTar(_ path: String, to destination: String) -> (Bool, String) {
         var candidates: [String] = []
         #if jailbreak
-        candidates = ["/var/jb/usr/bin/tar", "/usr/bin/tar", "/var/jb/bin/tar"]
+        candidates = ["/var/jb/usr/bin/tar", "/usr/bin/tar", "/var/jb/bin/tar", "/bin/tar"]
         #else
-        candidates = ["/usr/bin/tar", "/var/jb/usr/bin/tar"]
+        candidates = ["/usr/bin/tar", "/var/jb/usr/bin/tar", "/bin/tar"]
         #endif
 
         let fm = FileManager.default
@@ -281,17 +326,42 @@ struct SDKDownload: View {
             tarPath = candidate
             break
         }
-        guard let tar = tarPath else { return false }
+        guard let tar = tarPath else {
+            return (false, "系统里没有找到 tar 命令")
+        }
 
-        let command = "mkdir -p '\(destination)' && '\(tar)' -xzf '\(path)' -C '\(destination)' 2>/dev/null"
-        // 先以普通用户身份解压，失败再提权（rootless 下 tar 可能属于 root）
-        if shell(command, uid: 501, env: []) == 0 { return true }
-        #if !stock
-        if shell(command, uid: 0, env: []) == 0 { return true }
-        #endif
-        // 可能是未压缩的 .tar
-        let plain = "mkdir -p '\(destination)' && '\(tar)' -xf '\(path)' -C '\(destination)' 2>/dev/null"
-        return shell(plain, uid: 501, env: []) == 0
+        // gzip -dc | tar -x 比 tar -xzf 兼容性更好（部分 bsdtar 对 z 参数支持不一致）
+        // 注意：不要加 2>/dev/null，否则真实错误会被吞掉
+        let commands = [
+            "'\(tar)' -xzf '\(path)' -C '\(destination)'",
+            "'\(tar)' -xf '\(path)' -C '\(destination)'",
+            "gzip -dc '\(path)' | '\(tar)' -xf - -C '\(destination)'"
+        ]
+
+        var lastLog = ""
+        let uids: [uid_t] = [501, 0]
+        for command in commands {
+            for uid in uids {
+                #if stock
+                if uid == 0 { continue }
+                #endif
+                let output = runShellCapture(command, uid: uid)
+                if output.code == 0 { return (true, "") }
+                if !output.log.isEmpty { lastLog = output.log }
+            }
+        }
+        return (false, lastLog)
+    }
+
+    /// 执行命令并捕获输出，返回 (退出码, stderr+stdout)
+    private func runShellCapture(_ command: String, uid: uid_t) -> (code: Int, log: String) {
+        let outPath = "\(global_container)/tmp/sdk-tar-\(UUID()).log"
+        let full = command + " > '\(outPath)' 2>&1"
+        let code = shell(full, uid: uid, env: [])
+        var text = (try? String(contentsOfFile: outPath, encoding: .utf8)) ?? ""
+        _ = rm(outPath)
+        if text.count > 400 { text = String(text.suffix(400)) }
+        return (code, text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     /// 通过文件头判断是不是 tar / gzip
