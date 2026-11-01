@@ -151,10 +151,22 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
     let productsDir = appPath.isEmpty ? buildDir : (appPath as NSString).deletingLastPathComponent
     let targetBuildDir = productsDir
 
+    // 安装 macOS 工具模拟层：java_home / actool / xcodebuild / codesign 等
+    // 没有这层，工程脚本里的 macOS 专属命令会让 set -e 直接中止构建。
+    let shimInstall = installPlatformShims(projectPath: projectPath)
+    for shim in shimInstall.shims {
+        log("  兼容处理：\(shim.note)")
+    }
+
     var allSucceeded = true
 
     for (index, phase) in phases.enumerated() {
         log("[\(index + 1)/\(phases.count)] \(phase.name)")
+
+        // 先探测脚本里有哪些步骤设备上做不了，提前告知
+        for warning in detectUnsupportedSteps(phase.script) {
+            log("  注意：\(warning)")
+        }
 
         // 脚本写到文件再执行：内容可能有几十 KB，
         // 作为 bash -c 的单参数会超出 posix_spawn 限制。
@@ -175,10 +187,20 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
         body += "export PLATFORM_NAME=\"iphoneos\"\n"
         body += "export EFFECTIVE_PLATFORM_NAME=\"-iphoneos\"\n"
         body += "export TARGET_NAME=\"\((appPath as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: ""))\"\n"
-        body += "export PATH=\"/var/jb/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"\n"
+        // shim 目录放最前，让 java_home / actool / codesign 等落到我们的实现
+        body += "export PATH=\"" + shimInstall.dir + ":/var/jb/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"\n"
         body += "cd \"\(projectPath)\"\n"
+
+        // 软化脚本：替换 macOS 专属路径、降级 set -e、限制 Gradle 内存
+        let softened = softenShellScript(phase.script, projectPath: projectPath)
+        if !softened.notes.isEmpty {
+            for note in softened.notes {
+                log("  已处理：\(note)")
+            }
+        }
+
         body += "\n"
-        body += phase.script
+        body += softened.script
         body += "\n"
 
         cfile(atPath: scriptFile, withContent: body)
