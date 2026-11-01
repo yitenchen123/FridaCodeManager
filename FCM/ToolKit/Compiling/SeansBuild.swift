@@ -346,13 +346,15 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
             let unitsFile = "\(ProjectInfo.ProjectPath)/.fcm-units.txt"
             cfile(atPath: unitsFile, withContent: compileUnits.joined(separator: "\n"))
 
-            var jobs = ProcessInfo.processInfo.activeProcessorCount
-            if jobs > 8 { jobs = 8 }
-            if jobs < 2 { jobs = 2 }
+            // 调度策略：按可用内存而非只看 CPU 核数，避免 200+ 编译单元并行时被 jetsam
+            let scheduler = CompileScheduler.make(projectPath: ProjectInfo.ProjectPath,
+                                                  fileCount: pending.count)
+            _ = climessenger("build-plan", "调度：" + scheduler.reason)
+
             let runnerFile = "\(ProjectInfo.ProjectPath)/.fcm-run.sh"
             cfile(atPath: runnerFile, withContent:
                 "#!/bin/sh\nrm -rf '" + errorDir + "' ; mkdir -p '" + errorDir + "'\n"
-                + "cat '" + unitsFile + "' | xargs -P " + String(jobs) + " -I {} sh -c '{}'\n")
+                + "cat '" + unitsFile + "' | xargs -P " + String(scheduler.parallelism) + " -I {} sh -c '{}'\n")
 
             EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -f " + FAIL_LOG + " ; "
             EXEC += "sh '" + runnerFile + "' > " + FAIL_LOG + " 2>&1 ; "
