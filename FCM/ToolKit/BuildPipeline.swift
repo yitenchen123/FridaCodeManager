@@ -179,6 +179,31 @@ func verifyAppBundle(_ appPath: String) -> (Bool, [String]) {
     return (problems.isEmpty, problems)
 }
 
+/// 检查脚本阶段产出的 Java 相关目录是否有内容
+/// 很多工程（Air2 就是）依赖 App.app/Java/*.jar 才能启动，
+/// jar 缺失时 App 会崩溃，但 Xcode 不会报错，需要在打包前拦下来。
+func verifyJavaArtifacts(_ appPath: String) -> (ok: Bool, notes: [String]) {
+    let fm = FileManager.default
+    var notes: [String] = []
+    var hasJar = false
+
+    for sub in ["Java", "libs", "java_runtimes"] {
+        let dir = "\(appPath)/\(sub)"
+        guard fm.fileExists(atPath: dir) else { continue }
+        let entries = (try? fm.contentsOfDirectory(atPath: dir)) ?? []
+        let jars = entries.filter { $0.hasSuffix(".jar") }
+        if !jars.isEmpty {
+            hasJar = true
+            notes.append("\(sub)/：\(jars.count) 个 jar（" + jars.prefix(4).joined(separator: "、") + "）")
+        } else if !entries.isEmpty {
+            notes.append("\(sub)/：\(entries.count) 项（无 jar）")
+        }
+    }
+
+    // 有 Java 源码但产物里没有 jar → 脚本阶段可能失败了
+    return (hasJar || notes.isEmpty, notes)
+}
+
 // MARK: - 签名
 
 enum SignMode {
