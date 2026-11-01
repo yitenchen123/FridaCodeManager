@@ -63,6 +63,11 @@ struct XcodeBuildConfig {
     var stripStyle: String = ""                   // STRIP_STYLE
     var debugInformationFormat: String = ""       // DEBUG_INFORMATION_FORMAT
     var codeSignEntitlements: String = ""         // CODE_SIGN_ENTITLEMENTS
+    var excludedArchitectures: String = ""        // EXCLUDED_ARCHITECTURES
+    var assetCatalogAppIcon: String = ""          // ASSETCATALOG_COMPILER_APPICON_NAME
+    var assetCatalogAccentColor: String = ""      // ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME
+    var marketingVersion: String = ""             // MARKETING_VERSION
+    var currentProjectVersion: String = ""        // CURRENT_PROJECT_VERSION
     var resourcesFolderPath: String = ""          // UNLOCALIZED_RESOURCES_FOLDER_PATH
     var sourceFound: Bool = false
 }
@@ -125,6 +130,11 @@ func loadXcodeBuildConfig(projectPath: String) -> XcodeBuildConfig {
     config.stripStyle = parseStringSetting("STRIP_STYLE", in: text, projectPath: projectPath)
     config.debugInformationFormat = parseStringSetting("DEBUG_INFORMATION_FORMAT", in: text, projectPath: projectPath)
     config.codeSignEntitlements = parseStringSetting("CODE_SIGN_ENTITLEMENTS", in: text, projectPath: projectPath)
+    config.excludedArchitectures = parseStringSetting("EXCLUDED_ARCHITECTURES", in: text, projectPath: projectPath)
+    config.assetCatalogAppIcon = parseStringSetting("ASSETCATALOG_COMPILER_APPICON_NAME", in: text, projectPath: projectPath)
+    config.assetCatalogAccentColor = parseStringSetting("ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME", in: text, projectPath: projectPath)
+    config.marketingVersion = parseStringSetting("MARKETING_VERSION", in: text, projectPath: projectPath)
+    config.currentProjectVersion = parseStringSetting("CURRENT_PROJECT_VERSION", in: text, projectPath: projectPath)
     config.productBundleIdentifier = parseStringSetting("PRODUCT_BUNDLE_IDENTIFIER", in: text, projectPath: projectPath)
     config.deploymentTarget = parseStringSetting("IPHONEOS_DEPLOYMENT_TARGET", in: text, projectPath: projectPath)
 
@@ -409,10 +419,11 @@ func clangCodegenFlags(from config: XcodeBuildConfig) -> String {
         if !level.isEmpty { flags += " -O" + level }
     }
 
-    // C++ 语言标准：gnu++17 → -std=gnu++17
+    // C++ 语言标准：直接 -std=gnu++17
+    // 注意：不能写成 -Xclang -std=xxx，那是给 cc1 传参的错误用法
     if !config.cxxLanguageStandard.isEmpty {
         let cxx = config.cxxLanguageStandard.trimmingCharacters(in: .whitespaces)
-        if !cxx.isEmpty { flags += " -Xclang -std=" + cxx }
+        if !cxx.isEmpty { flags += " -std=" + cxx }
     }
 
     // 严格 objc msgSend 检查会插入额外检查，设备上关闭可减少运行时开销
@@ -421,6 +432,44 @@ func clangCodegenFlags(from config: XcodeBuildConfig) -> String {
     }
 
     return flags
+}
+
+/// 解析目标架构
+/// 依据 ARCHS / VALID_ARCHS / EXCLUDED_ARCHITECTURES / ONLY_ACTIVE_ARCH
+/// 返回 clang 可用的 -arch 参数（空字符串表示用默认 arm64）
+func resolveTargetArchitectures(from config: XcodeBuildConfig) -> [String] {
+    // EXCLUDED_ARCHITECTURES 用于排除（模拟器常见 x86_64）
+    var excluded: [String] = []
+    if !config.excludedArchitectures.isEmpty {
+        excluded = config.excludedArchitectures
+            .replacingOccurrences(of: "$(inherited)", with: "")
+            .split(whereSeparator: { $0 == " " || $0 == "," })
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    var archs: [String] = []
+    let source = config.architectures.isEmpty ? config.validArchs : config.architectures
+    if !source.isEmpty {
+        // ARCHS 形如 "arm64" 或 "$(ARCHS_STANDARD)"
+        // $(ARCHS_STANDARD) 对 iOS 设备即 arm64
+        let cleaned = source
+            .replacingOccurrences(of: "$(ARCHS_STANDARD)", with: "arm64")
+            .replacingOccurrences(of: "$(ARCHS_STANDARD_64_BIT)", with: "arm64")
+            .replacingOccurrences(of: "$(ARCHS_STANDARD_32_64_BIT)", with: "arm64")
+            .replacingOccurrences(of: "$(inherited)", with: "")
+        archs = cleaned
+            .split(whereSeparator: { $0 == " " || $0 == "," })
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    if archs.isEmpty {
+        archs = ["arm64"]
+    }
+    // 去掉被排除的
+    archs = archs.filter { !excluded.contains($0) }
+    return archs.isEmpty ? ["arm64"] : archs
 }
 
 /// 把工程配置转成链接阶段的 runpath 参数

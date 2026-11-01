@@ -296,7 +296,17 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     // 现代 Objective-C 基本都用 ARC；不开 ARC 时任何 __weak 都会直接报错
     // （cannot create __weak reference in file using manual reference counting）。
     // 如需关闭，在工程的 api.api 里写 <noarc>true</noarc>。
-    var objcFlags = " -fobjc-arc -fobjc-link-runtime" + headerFlags + defineFlags + codegenFlags
+    // 目标架构：依据 ARCHS / VALID_ARCHS / EXCLUDED_ARCHITECTURES
+    let targetArchs = resolveTargetArchitectures(from: xcodeConfig)
+    var archFlags = ""
+    for arch in targetArchs {
+        archFlags += " -arch " + arch
+    }
+    if targetArchs != ["arm64"] {
+        _ = climessenger("xcode-config", "目标架构：" + targetArchs.joined(separator: ", "))
+    }
+
+    var objcFlags = " -fobjc-arc -fobjc-link-runtime" + headerFlags + defineFlags + codegenFlags + archFlags
     // Xcode 工程里显式关闭 ARC 时以工程配置为准
     if !xcodeConfig.enableObjCARC || apiextension.noarc {
         objcFlags = " -fno-objc-arc"
