@@ -378,7 +378,6 @@ func adoptStagedDirectory(_ staging: String) -> ImportOutcome {
 
 /// 把工程目录移动到 Documents 下并返回结果
 private func installProject(from root: String) -> ImportOutcome {
-    let fm = FileManager.default
     let targetUUID = "\(UUID())"
     let destination = "\(global_documents)/\(targetUUID)"
 
