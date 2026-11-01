@@ -32,7 +32,63 @@ import Foundation
 import SwiftUI
 import Darwin
 
+/// 找出本机真正可用的 SDK 名
+/// 优先：工程指定的（若已安装）→ 同主版本最高的 → 设置里的默认 → 任意一个已安装的
+func resolveAvailableSDK(_ requested: String) -> String {
+    let fm = FileManager.default
+    let installed = ((try? fm.contentsOfDirectory(atPath: global_sdkpath)) ?? [])
+        .filter { $0.hasPrefix("iPhoneOS") && $0.hasSuffix(".sdk") }
+
+    if installed.isEmpty { return requested }
+    if installed.contains(requested) { return requested }
+
+    // 同主版本（例如 16.5 找不到时，用 16.x）
+    let wantedMajor = requested
+        .replacingOccurrences(of: "iPhoneOS", with: "")
+        .replacingOccurrences(of: ".sdk", with: "")
+        .split(separator: ".").first.map(String.init)
+
+    if let major = wantedMajor {
+        let sameMajor = installed.filter {
+            $0.replacingOccurrences(of: "iPhoneOS", with: "")
+                .replacingOccurrences(of: ".sdk", with: "")
+                .hasPrefix(major + ".")
+        }
+        if let best = sameMajor.sorted(by: { versionKey($0) < versionKey($1) }).last {
+            print("SDK \"\(requested)\" 未安装，自动使用 \"\(best)\"")
+            return best
+        }
+    }
+
+    // 设置里的默认 SDK
+    let fallback = UserDefaults.standard.string(forKey: "sdk") ?? ""
+    if installed.contains(fallback) {
+        print("SDK \"\(requested)\" 未安装，自动使用默认 \"\(fallback)\"")
+        return fallback
+    }
+
+    // 任意一个最简单的
+    if let any = installed.sorted(by: { versionKey($0) < versionKey($1) }).last {
+        print("SDK \"\(requested)\" 未安装，自动使用 \"\(any)\"")
+        return any
+    }
+    return requested
+}
+
+/// 把 iPhoneOS16.4.sdk 转成可比较的数字元组
+func versionKey(_ sdkName: String) -> [Int] {
+    let raw = sdkName
+        .replacingOccurrences(of: "iPhoneOS", with: "")
+        .replacingOccurrences(of: ".sdk", with: "")
+    return raw.split(separator: ".").map { Int($0) ?? 0 }
+}
+
 func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ progress: Binding<Double>?) -> Int {
+    // 工程里写的 SDK 可能在本机没有安装（常见于别人分享的工程），
+    // 这里自动回退到「已安装的同系列 SDK」或「设置里的默认 SDK」，避免每次都要手动改。
+    var ProjectInfo = ProjectInfo
+    ProjectInfo.SDK = resolveAvailableSDK(ProjectInfo.SDK)
+
     let info: [String] = ["\(ProjectInfo.ProjectPath)/Payload","\(ProjectInfo.ProjectPath)/Payload/\(ProjectInfo.Executable).app","\(ProjectInfo.ProjectPath)/Resources","\(global_sdkpath)/\(ProjectInfo.SDK)","\(ProjectInfo.ProjectPath)/clang","\(ProjectInfo.ProjectPath)/bridge.h","\(ProjectInfo.ProjectPath)/entitlements.plist","\(load("\(ProjectInfo.ProjectPath)/api.api"))"]
     //PayloadPath  info[0]
     //AppPath      info[1]
