@@ -77,8 +77,11 @@ func FindFilesStack(_ projectPath: String, _ fileExtensions: [String], _ ignore:
         var objCFiles: [String] = []
 
         for file in allFiles {
-            if fileExtensionsSet.contains(where: { file.hasSuffix($0) }) &&
-               !ignoreSet.contains(where: { file.hasPrefix($0) }) {
+            // 注意：ignore 里可能出现空字符串（splitAndTrim("") 会返回 [""]），
+            // 而 hasPrefix("") 恒为 true —— 那会把所有文件都过滤掉，
+            // 表现为"编译瞬间完成，一个文件都没编"。
+            let ignored = ignoreSet.contains(where: { !$0.isEmpty && file.hasPrefix($0) })
+            if fileExtensionsSet.contains(where: { file.hasSuffix($0) }) && !ignored {
                 // 这里只返回相对路径，引号统一在拼接命令时加，
                 // 否则会出现 /工程路径/'相对路径' 这种把引号包在中间的写法，
                 // clang 会把 '文件名' 当成目录名，导致编译中断。

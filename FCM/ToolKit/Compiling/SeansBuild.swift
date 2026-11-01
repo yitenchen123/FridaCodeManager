@@ -247,7 +247,6 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
                 ].joined()
             }.joined()
         }
-        EXEC += "mkdir -p '" + info[1] + "' ; "
         EXEC += """
         swiftc -D\(ProjectInfo.Macro) \(quotedList(ProjectInfo.ProjectPath, SwiftFiles)) \(quotedList(ProjectInfo.ProjectPath, AFiles)) \(MFiles.isEmpty ? "" : "clang/*.o") \(apiextension.build) \
         \(FileManager.default.fileExists(atPath: info[5]) ? "-import-objc-header '\(info[5])'" : "") -parse-as-library -target arm64-apple-ios\(ProjectInfo.TG) -o '\(info[1])/\(ProjectInfo.Executable)'
@@ -272,15 +271,12 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
                 "echo ", Q, mFile, Q, " >> " + FAIL_LOG
                 ].joined()
         }.joined()
-        // 链接前确保：输出目录存在、.o 文件确实产出过
         EXEC += "mkdir -p '" + info[1] + "' ; "
-        EXEC += "if [ -z \"\$(ls clang/*.o 2>/dev/null | head -1)\" ]; then echo 'NO-OBJECT-FILES 所有源文件都编译失败' >> " + FAIL_LOG + " ; fi ; "
         EXEC += """
-        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, AFiles)) clang/*.o -o '\(info[1])/\(ProjectInfo.Executable)' \
-        || echo 'LINK-FAILED' >> """ + FAIL_LOG + """
+        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, AFiles)) clang/*.o -o '\(info[1])/\(ProjectInfo.Executable)'
         """
         EXEC += " ; "
-        EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '编译/链接失败：'; cat " + FAIL_LOG + "; exit 1; fi"
+        EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '以下文件编译失败：'; cat " + FAIL_LOG + "; exit 1; fi"
         #elseif trollstore
         EXEC += """
         clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, MFiles)) \(quotedList(ProjectInfo.ProjectPath, AFiles)) \
