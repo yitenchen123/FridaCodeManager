@@ -59,6 +59,40 @@ func detectJavaToolchain(projectPath: String) -> JavaToolchainInfo {
     let fm = FileManager.default
     var info = JavaToolchainInfo()
 
+    // ---- 0) 优先检查标准 JDK 布局（bin/javac + lib/tools.jar）----
+    // 这是完整的 JDK，能真正运行 javac（javac 自身是依赖 tools.jar 的 Java 程序）。
+    // 常见放置位置：
+    //   <工程>/.fcm-jdk/            FCM 推荐位置
+    //   <工程>/jdk8/                工程自带
+    //   Documents/.fcm-jdk/         全局共享
+    let standardJDKCandidates = [
+        "\(projectPath)/.fcm-jdk",
+        "\(projectPath)/jdk8",
+        "\(projectPath)/jdk",
+        "\(global_documents)/.fcm-jdk"
+    ]
+    for candidate in standardJDKCandidates {
+        let javac = "\(candidate)/bin/javac"
+        let tools = "\(candidate)/lib/tools.jar"
+        guard fm.isExecutableFile(atPath: javac) else { continue }
+        // 完整 JDK 应同时具备 tools.jar（javac 的实现）
+        let isFullJDK = fm.fileExists(atPath: tools)
+
+        info.home = candidate
+        info.javacPath = javac
+        info.jarPath = fm.isExecutableFile(atPath: "\(candidate)/bin/jar") ? "\(candidate)/bin/jar" : nil
+        info.source = isFullJDK ? "标准 JDK（含 tools.jar）" : "JDK 布局"
+
+        let versionResult = runCaptured("'\(javac)' -version", uid: 501)
+        if let range = versionResult.output.range(of: "javac ") {
+            info.version = String(versionResult.output[range.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let probe = runCaptured("'\(javac)' -source 8 -target 8 -version", uid: 501)
+        info.supportsJava8Target = probe.succeeded
+        return info
+    }
+
     // ---- 1) 工程自带的 JRE ----
     var candidates: [(String, String)] = []   // (home, 来源说明)
     let searchRoots = [
@@ -163,7 +197,8 @@ func describeJavaToolchain(_ info: JavaToolchainInfo) -> String {
         var text = "未找到可用的 JDK（需要 javac 与 jar）\n"
         text += "安装方式（任选其一）：\n"
         text += "  · 在设备终端执行：apt install openjdk-17（或 openjdk-11 / openjdk-8）\n"
-        text += "  · 把 JDK 解压到 \(global_documents)/.fcm-jdk/（要求含 bin/javac）\n"
+        text += "  · 把 JDK 解压到 \(global_documents)/.fcm-jdk/ 或 <工程>/.fcm-jdk/\n"
+        text += "    （要求含 bin/javac 与 lib/tools.jar；iOS aarch64 版 OpenJDK 8 可用）\n"
         text += "  · 工程内放置 java_runtimes/<版本>/ 目录\n"
         return text
     }
