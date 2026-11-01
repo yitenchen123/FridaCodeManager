@@ -111,21 +111,76 @@ private func expandVariables(_ value: String, projectPath: String) -> String {
 ///       "$(SRCROOT)/Natives",
 ///   );
 /// 或单值形式 HEADER_SEARCH_PATHS = "$(SRCROOT)/inc";
+///
+/// ★ 不能用正则 [^)]* 匹配数组体 ★
+///   $(inherited)、$(SRCROOT) 内部本身含括号，
+///   正则会在这里提前截断，得到 "$(inherited" 这种残缺值，
+///   拼进 clang 参数后整条命令语法错误。
+///   必须按括号配对扫描。
 private func parseListSetting(_ key: String, in text: String, projectPath: String) -> [String] {
     var values: [String] = []
 
-    // 数组形式
-    let arrayPattern = key + "\\s*=\\s*\\(([^)]*)\\)"
-    if let regex = try? NSRegularExpression(pattern: arrayPattern, options: [.dotMatchesLineSeparators]) {
-        let ns = text as NSString
-        for match in regex.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
-            guard match.numberOfRanges > 1 else { continue }
-            let body = ns.substring(with: match.range(at: 1))
-            for rawLine in body.components(separatedBy: ",") {
-                let cleaned = rawLine
+    let chars = Array(text)
+    var searchIndex = 0
+
+    while searchIndex < chars.count {
+        // 定位 "KEY" 后跟 "="
+        guard let keyRange = findKey(key, in: chars, from: searchIndex) else { break }
+        var i = keyRange.upperBound
+        searchIndex = keyRange.upperBound
+
+        // 跳过空白与 '='
+        while i < chars.count, chars[i] == " " || chars[i] == "\t" { i += 1 }
+        guard i < chars.count, chars[i] == "=" else { continue }
+        i += 1
+        while i < chars.count, chars[i] == " " || chars[i] == "\t" || chars[i] == "\n" { i += 1 }
+        guard i < chars.count else { break }
+
+        if chars[i] == "(" {
+            // ---- 数组形式：括号配对扫描 ----
+            var depth = 0
+            var body: [Character] = []
+            var j = i
+            while j < chars.count {
+                let c = chars[j]
+                if c == "(" {
+                    depth += 1
+                    if depth == 1 { j += 1; continue }
+                } else if c == ")" {
+                    depth -= 1
+                    if depth == 0 { j += 1; break }
+                }
+                body.append(c)
+                j += 1
+            }
+            searchIndex = j
+
+            // 按顶层逗号切分（$(...) 内部的逗号不算）
+            for rawItem in splitTopLevelCommas(String(body)) {
+                let cleaned = rawItem
                     .replacingOccurrences(of: "\"", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if cleaned.isEmpty { continue }
+                // 跳过 $(inherited) 这类占位符
+                let expanded = expandVariables(cleaned, projectPath: projectPath)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if expanded.isEmpty || expanded == "$" { continue }
+                if !values.contains(expanded) {
+                    values.append(expanded)
+                }
+            }
+        } else {
+            // ---- 单值形式：读到分号 ----
+            var raw: [Character] = []
+            var j = i
+            while j < chars.count, chars[j] != ";" {
+                raw.append(chars[j])
+                j += 1
+            }
+            searchIndex = j + 1
+            let cleaned = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            if !cleaned.isEmpty {
                 let expanded = expandVariables(cleaned, projectPath: projectPath)
                 if !expanded.isEmpty && !values.contains(expanded) {
                     values.append(expanded)
@@ -134,25 +189,66 @@ private func parseListSetting(_ key: String, in text: String, projectPath: Strin
         }
     }
 
-    // 单值形式
-    if values.isEmpty {
-        let singlePattern = key + "\\s*=\\s*\"?([^;\"\\n]+)\"?\\s*;"
-        if let regex = try? NSRegularExpression(pattern: singlePattern) {
-            let ns = text as NSString
-            for match in regex.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
-                guard match.numberOfRanges > 1 else { continue }
-                let raw = ns.substring(with: match.range(at: 1))
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if raw.isEmpty || raw.hasPrefix("(") { continue }
-                let expanded = expandVariables(raw, projectPath: projectPath)
-                if !expanded.isEmpty && !values.contains(expanded) {
-                    values.append(expanded)
-                }
+    return values
+}
+
+/// 在字符数组里定位 "KEY" 的位置（要求前面不是字母数字，避免误匹配 XXX_KEY）
+private func findKey(_ key: String, in chars: [Character], from start: Int) -> Range<Int>? {
+    let keyChars = Array(key)
+    guard keyChars.count > 0, chars.count >= keyChars.count else { return nil }
+
+    var i = start
+    while i + keyChars.count <= chars.count {
+        var matched = true
+        for k in 0..<keyChars.count where chars[i + k] != keyChars[k] {
+            matched = false
+            break
+        }
+        if matched {
+            // 前面不能紧跟字母数字下划线
+            if i == 0 {
+                return i..<(i + keyChars.count)
+            }
+            let prev = chars[i - 1]
+            if !(prev.isLetter || prev.isNumber || prev == "_") {
+                return i..<(i + keyChars.count)
             }
         }
+        i += 1
     }
+    return nil
+}
 
-    return values
+/// 按顶层逗号切分：忽略括号与引号内部的逗号
+private func splitTopLevelCommas(_ input: String) -> [String] {
+    var parts: [String] = []
+    var current: [Character] = []
+    var depth = 0
+    var inQuote = false
+
+    for c in input {
+        if c == "\"" {
+            inQuote.toggle()
+            current.append(c)
+            continue
+        }
+        if !inQuote {
+            if c == "(" {
+                depth += 1
+            } else if c == ")" {
+                depth -= 1
+            } else if c == "," && depth == 0 {
+                parts.append(String(current))
+                current = []
+                continue
+            }
+        }
+        current.append(c)
+    }
+    if !current.isEmpty {
+        parts.append(String(current))
+    }
+    return parts
 }
 
 private func parseStringSetting(_ key: String, in text: String, projectPath: String) -> String {
@@ -181,11 +277,32 @@ private func parseBoolSetting(_ key: String, in text: String, defaultValue: Bool
 
 // MARK: - 转成 clang 参数
 
+/// 判断一个值是否是合法的 shell 参数
+/// 防止解析残留（如 "$(inherited" 这种括号不配对的残片）污染整条编译命令
+func isValidShellArgument(_ value: String) -> Bool {
+    if value.isEmpty { return false }
+    // 括号必须配对
+    var depth = 0
+    for c in value {
+        if c == "(" { depth += 1 }
+        else if c == ")" {
+            depth -= 1
+            if depth < 0 { return false }
+        }
+    }
+    if depth != 0 { return false }
+    // 不能含有未展开的变量残留
+    if value.hasPrefix("$(") && !value.contains(")") { return false }
+    return true
+}
+
 /// 把工程配置转成 clang 的 include 参数
 func clangIncludeFlags(from config: XcodeBuildConfig) -> String {
     var flags = ""
     var seen = Set<String>()
     for path in config.headerSearchPaths where !seen.contains(path) {
+        // 过滤掉解析残留，宁可少一个 -I 也不让整条命令语法错误
+        guard isValidShellArgument(path) else { continue }
         seen.insert(path)
         flags += " -I" + shellQuote(path)
     }
@@ -208,6 +325,7 @@ func clangLinkFlags(from config: XcodeBuildConfig) -> String {
             flag = String(flag.dropFirst().dropLast())
         }
         if flag.isEmpty { continue }
+        guard isValidShellArgument(flag) else { continue }
         flags += " " + shellQuote(flag)
     }
     return flags
@@ -219,6 +337,7 @@ func clangDefineFlags(from config: XcodeBuildConfig) -> String {
     for raw in config.preprocessorDefinitions {
         let value = raw.trimmingCharacters(in: .whitespaces)
         if value.isEmpty { continue }
+        guard isValidShellArgument(value) else { continue }
         // DEBUG=1 这种直接透传
         flags += " -D" + shellQuote(value)
     }
