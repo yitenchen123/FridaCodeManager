@@ -189,21 +189,20 @@ struct SDKDownload: View {
                 let scope = fileURL.startAccessingSecurityScopedResource()
                 let staged = "\(global_container)/tmp/sdk-import-\(UUID())"
                 cfolder(atPath: staged)
-                let ok = libzip_unzip(fileURL.path, staged) == 0
+                var ok = libzip_unzip(fileURL.path, staged) == 0
+                // libzip 不认 tar.gz，扩展名是 tgz/tar.gz 时交给系统 tar
+                let lower = fileURL.lastPathComponent.lowercased()
+                if !ok && (lower.hasSuffix(".tgz") || lower.hasSuffix(".tar.gz") || lower.hasSuffix(".tar")) {
+                    #if !stock
+                    let code = shell("mkdir -p '\(staged)' && tar xzf '\(fileURL.path)' -C '\(staged)' 2>/dev/null", uid: 501, env: [])
+                    ok = (code == 0)
+                    #endif
+                }
                 if scope { fileURL.stopAccessingSecurityScopedResource() }
 
                 var found: [String] = []
                 if ok {
-                    // 支持 zip 里多套一层目录
-                    var root = staged
-                    if let one = singleSubdirectory(of: staged) { root = one }
-                    let entries = (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []
-                    found = entries.filter { $0.hasPrefix("iPhoneOS") && $0.hasSuffix(".sdk") }
-                    for sdkName in found {
-                        let dest = "\(global_sdkpath)/\(sdkName)"
-                        _ = rm(dest)
-                        _ = mv("\(root)/\(sdkName)", dest)
-                    }
+                    found = collectSDKs(in: staged)
                 }
                 _ = rm(staged)
 
@@ -214,11 +213,11 @@ struct SDKDownload: View {
                     if found.isEmpty {
                         status = ""
                         haptfeedback(2)
-                        showAlert(with: "导入失败：压缩包里没有 iPhoneOS*.sdk 目录")
+                        showAlert(with: "导入失败：压缩包里没有找到 iPhoneOS*.sdk 目录\n\n支持的格式：zip、tar.gz / tgz")
                     } else {
-                        status = "已导入 \(found.count) 个 SDK"
+                        status = "已导入：\(found.joined(separator: "、"))"
                         haptfeedback(1)
-                        showAlert(with: "已导入：\n" + found.joined(separator: "\n"))
+                        showAlert(with: "已导入 SDK：\n" + found.joined(separator: "\n"))
                     }
                 }
             }
@@ -227,6 +226,54 @@ struct SDKDownload: View {
             status = ""
             showAlert(with: "导入失败：\(error.localizedDescription)")
         }
+    }
+
+    /// 在解压目录里找出 SDK（可能多套一层，也可能是没有版本号的 iPhoneOS.sdk）
+    private func collectSDKs(in staged: String) -> [String] {
+        let fm = FileManager.default
+        var roots = [staged]
+        // 往下剥最多 3 层“只有一个子目录”的情况
+        var cursor = staged
+        for _ in 0..<3 {
+            guard let one = singleSubdirectory(of: cursor) else { break }
+            roots.append(one)
+            cursor = one
+        }
+
+        var results: [String] = []
+        for root in roots {
+            let entries = (try? fm.contentsOfDirectory(atPath: root)) ?? []
+            for name in entries where name.hasSuffix(".sdk") && name.hasPrefix("iPhoneOS") {
+                let src = "\(root)/\(name)"
+                // 版本号从 SDKSettings.plist 里读，读到就用规范名 iPhoneOS<ver>.sdk
+                let version = sdkVersion(of: src)
+                let finalName = version.isEmpty ? name : "iPhoneOS\(version).sdk"
+                let dest = "\(global_sdkpath)/\(finalName)"
+                _ = rm(dest)
+                if mv(src, dest) == 0 {
+                    results.append(version.isEmpty ? name : "iOS \(version)")
+                }
+                break
+            }
+            if !results.isEmpty { break }
+        }
+        return results
+    }
+
+    /// 读取 SDKSettings.plist 里的 Version
+    private func sdkVersion(of sdkPath: String) -> String {
+        let plist = "\(sdkPath)/SDKSettings.plist"
+        if let dict = NSDictionary(contentsOfFile: plist) as? [String: Any],
+           let version = dict["Version"] as? String {
+            return version
+        }
+        let json = "\(sdkPath)/SDKSettings.json"
+        if let data = FileManager.default.contents(atPath: json),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let version = obj["Version"] as? String {
+            return version
+        }
+        return ""
     }
 
     // MARK: - 移除
