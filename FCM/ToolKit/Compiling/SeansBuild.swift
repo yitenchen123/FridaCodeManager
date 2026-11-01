@@ -238,10 +238,19 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
 
     let xcodeLinkFlags = clangLinkFlags(from: xcodeConfig)
     let defineFlags = clangDefineFlags(from: xcodeConfig)
+    // 语言标准与优化级别：GCC_C_LANGUAGE_STANDARD / GCC_OPTIMIZATION_LEVEL
+    let codegenFlags = clangCodegenFlags(from: xcodeConfig)
+    // 动态库搜索路径：LD_RUNPATH_SEARCH_PATHS
+    let runpathFlags = clangRunpathFlags(from: xcodeConfig)
+
+    if !codegenFlags.isEmpty {
+        _ = climessenger("xcode-config", "编译选项：" + codegenFlags)
+    }
 
     let frameflags = (frameworks.map { "-framework \($0)" }.joined(separator: " ")
                     + localFrameworkFlags
-                    + xcodeLinkFlags)
+                    + xcodeLinkFlags
+                    + runpathFlags)
 
     // 如果工程带 .github/workflows，优先执行其中的依赖准备步骤。
     // 很多项目的第三方库（mbedtls / JRE / 预编译 dylib）不进 git，
@@ -268,7 +277,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     // 现代 Objective-C 基本都用 ARC；不开 ARC 时任何 __weak 都会直接报错
     // （cannot create __weak reference in file using manual reference counting）。
     // 如需关闭，在工程的 api.api 里写 <noarc>true</noarc>。
-    var objcFlags = " -fobjc-arc -fobjc-link-runtime" + headerFlags + defineFlags
+    var objcFlags = " -fobjc-arc -fobjc-link-runtime" + headerFlags + defineFlags + codegenFlags
     // Xcode 工程里显式关闭 ARC 时以工程配置为准
     if !xcodeConfig.enableObjCARC || apiextension.noarc {
         objcFlags = " -fno-objc-arc"
@@ -431,6 +440,16 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         _ = climessenger("local-frameworks", fwReport)
     }
 
+    // ---------------- 构建前诊断 ----------------
+    // 一次性检查所有已知会失败的条件，避免用户逐个试错。
+    let diagnostics = runBuildDiagnostics(projectPath: ProjectInfo.ProjectPath)
+    for line in diagnostics.formatted().split(separator: "\n") {
+        _ = climessenger("preflight", String(line))
+    }
+    if diagnostics.hasBlockingIssue {
+        _ = climessenger("preflight", "存在 \(diagnostics.errorCount) 个阻断性问题，构建可能失败")
+    }
+
     // ---------------- 编译 ----------------
     messenger(status, progress, BuildStage.compile.display, 0.3)
 
@@ -540,6 +559,17 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         }
         _ = rm(info[0])
         return 1
+    }
+
+    // Java 产物校验：Air2 这类工程的启动依赖 App.app/Java/*.jar，
+    // 脚本阶段若失败，jar 缺失会导致 App 启动即崩溃。
+    let javaCheck = verifyJavaArtifacts(stagingApp)
+    if !javaCheck.notes.isEmpty {
+        for note in javaCheck.notes {
+            _ = climessenger("verify-stage", "Java 产物：" + note)
+        }
+    } else if !shellPhases.isEmpty {
+        _ = climessenger("verify-stage", "提示：工程有脚本阶段，但产物里没有发现 jar")
     }
 
     let macho = verifyMachO(executablePath)

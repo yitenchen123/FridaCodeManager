@@ -41,6 +41,13 @@ struct XcodeBuildConfig {
     var infoplistFile: String = ""
     var productBundleIdentifier: String = ""
     var deploymentTarget: String = ""
+    var clanguageStandard: String = ""
+    var optimizationLevel: String = ""
+    var deadCodeStripping: String = ""
+    var generateInfoPlist: Bool = true
+    var strictObjCMsgSend: Bool = false
+    var runpathSearchPaths: [String] = []
+    var supportedPlatforms: String = ""
     var sourceFound: Bool = false
 }
 
@@ -80,6 +87,13 @@ func loadXcodeBuildConfig(projectPath: String) -> XcodeBuildConfig {
 
     // ---- 字符串设置 ----
     config.infoplistFile = parseStringSetting("INFOPLIST_FILE", in: text, projectPath: projectPath)
+    config.clanguageStandard = parseStringSetting("GCC_C_LANGUAGE_STANDARD", in: text, projectPath: projectPath)
+    config.optimizationLevel = parseStringSetting("GCC_OPTIMIZATION_LEVEL", in: text, projectPath: projectPath)
+    config.deadCodeStripping = parseStringSetting("DEAD_CODE_STRIPPING", in: text, projectPath: projectPath)
+    config.supportedPlatforms = parseStringSetting("SUPPORTED_PLATFORMS", in: text, projectPath: projectPath)
+    config.runpathSearchPaths = parseListSetting("LD_RUNPATH_SEARCH_PATHS", in: text, projectPath: projectPath)
+    config.strictObjCMsgSend = parseBoolSetting("ENABLE_STRICT_OBJC_MSGSEND", in: text, defaultValue: false)
+    config.generateInfoPlist = parseBoolSetting("GENERATE_INFOPLIST_FILE", in: text, defaultValue: true)
     config.productBundleIdentifier = parseStringSetting("PRODUCT_BUNDLE_IDENTIFIER", in: text, projectPath: projectPath)
     config.deploymentTarget = parseStringSetting("IPHONEOS_DEPLOYMENT_TARGET", in: text, projectPath: projectPath)
 
@@ -327,6 +341,41 @@ func clangLinkFlags(from config: XcodeBuildConfig) -> String {
         if flag.isEmpty { continue }
         guard isValidShellArgument(flag) else { continue }
         flags += " " + shellQuote(flag)
+    }
+    return flags
+}
+
+/// 把工程配置转成语言标准与优化相关的 clang 参数
+func clangCodegenFlags(from config: XcodeBuildConfig) -> String {
+    var flags = ""
+
+    // C 语言标准：gnu17 → -std=gnu17
+    if !config.clanguageStandard.isEmpty {
+        let std = config.clanguageStandard.trimmingCharacters(in: .whitespaces)
+        if !std.isEmpty { flags += " -std=" + std }
+    }
+
+    // 优化级别：0 / 1 / 2 / 3 / s / fast
+    if !config.optimizationLevel.isEmpty {
+        let level = config.optimizationLevel.trimmingCharacters(in: .whitespaces)
+        if !level.isEmpty { flags += " -O" + level }
+    }
+
+    // 严格 objc msgSend 检查会插入额外检查，设备上关闭可减少运行时开销
+    if config.strictObjCMsgSend {
+        flags += " -fno-strict-objc-msgsend"
+    }
+
+    return flags
+}
+
+/// 把工程配置转成链接阶段的 runpath 参数
+func clangRunpathFlags(from config: XcodeBuildConfig) -> String {
+    var flags = ""
+    for path in config.runpathSearchPaths where !path.isEmpty {
+        guard isValidShellArgument(path) else { continue }
+        // $(inherited) 等已被展开过滤
+        flags += " -Wl,-rpath," + shellQuote(path)
     }
     return flags
 }
