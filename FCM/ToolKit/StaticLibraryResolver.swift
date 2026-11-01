@@ -220,6 +220,52 @@ func machoPlatformOnly(_ path: String) -> String? {
     return nil
 }
 
+/// 处理 .xcframework 里的静态库二进制
+/// xcframework 内部结构：
+///   libterracotta.xcframework/
+///     ios-arm64/
+///       libterracotta.a        ← 我们要的
+///       Headers/
+///     ios-arm64_x86_64-simulator/
+///       libterracotta.a        ← 排除
+func collectIOSStaticFromXCFrameworks(projectPath: String, ignorePrefixes: [String]) -> [String] {
+    let fm = FileManager.default
+    guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else { return [] }
+    let ignoreSet = Set(ignorePrefixes.filter { !$0.isEmpty })
+
+    var result: [String] = []
+    for entry in all where entry.hasSuffix(".xcframework") {
+        if ignoreSet.contains(where: { entry.hasPrefix($0) }) { continue }
+
+        let xcfPath = "\(projectPath)/\(entry)"
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: xcfPath, isDirectory: &isDir), isDir.boolValue else { continue }
+
+        // 枚举里层 slice 目录
+        guard let slices = try? fm.contentsOfDirectory(atPath: xcfPath) else { continue }
+        for slice in slices where slice.hasPrefix("ios-") {
+            // 只要设备切片，排除 simulator
+            if slice.contains("simulator") { continue }
+            let slicePath = "\(xcfPath)/\(slice)"
+
+            guard let files = try? fm.contentsOfDirectory(atPath: slicePath) else { continue }
+            for file in files where file.hasSuffix(".a") {
+                let full = "\(slicePath)/\(file)"
+                if let platform = staticLibraryPlatform(full),
+                   platform != "arm64" && platform != "armv7" {
+                    continue
+                }
+                // 转换成工程内相对路径，与其它库保持一致的引用方式
+                let relative = "\(entry)/\(slice)/\(file)"
+                if !result.contains(relative) {
+                    result.append(relative)
+                }
+            }
+        }
+    }
+    return result.sorted()
+}
+
 /// 收集可用的 .framework 及其二进制路径（只收 arm64 的）
 func collectIOSFrameworks(projectPath: String, ignorePrefixes: [String]) -> [(name: String, path: String)] {
     let fm = FileManager.default

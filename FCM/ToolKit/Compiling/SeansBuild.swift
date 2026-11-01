@@ -192,7 +192,14 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
 
     //finding code files
     messenger(status,progress,"finding code files",0.1)
-    let (MFiles, AFiles, SwiftFiles) = (FindFilesStack(ProjectInfo.ProjectPath, [".m", ".c", ".mm", ".cpp"], splitAndTrim(apiextension.ign) + ["Resources"]), collectIOSStaticLibraries(projectPath: ProjectInfo.ProjectPath, ignorePrefixes: splitAndTrim(apiextension.ign) + ["Resources"]), FindFilesStack(ProjectInfo.ProjectPath, [".swift"], splitAndTrim(apiextension.ign) + ["Resources"]))
+    let ignoreList = splitAndTrim(apiextension.ign) + ["Resources"]
+    let (MFiles, SwiftFiles) = (
+        FindFilesStack(ProjectInfo.ProjectPath, [".m", ".c", ".mm", ".cpp"], ignoreList),
+        FindFilesStack(ProjectInfo.ProjectPath, [".swift"], ignoreList)
+    )
+    // 静态库来源有两处：普通 .a，以及 .xcframework 里的设备切片
+    let AFiles = (collectIOSStaticLibraries(projectPath: ProjectInfo.ProjectPath, ignorePrefixes: ignoreList)
+                + collectIOSStaticFromXCFrameworks(projectPath: ProjectInfo.ProjectPath, ignorePrefixes: ignoreList)).sorted()
 
     //finding frameworks
     messenger(status,progress,"finding frameworks", 0.15)
@@ -292,12 +299,15 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
 
         let pending = plan.units.filter { $0.needsRebuild }
         if !pending.isEmpty {
+            let errorDir = "\(ProjectInfo.ProjectPath)/.fcm-errors"
             let compileUnits = pending.map { unit in
-                [
+                let errFile = errorDir + "/" + (unit.object as NSString).lastPathComponent + ".txt"
+                return [
                     "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) -c ",
                     quoted(ProjectInfo.ProjectPath, unit.source),
                     " -o ", quoted(ProjectInfo.ProjectPath, "./clang/" + (unit.object as NSString).lastPathComponent),
-                    " 2>&1 || echo ", Q, "FAILED: " + unit.source, Q
+                    " > ", quoted(ProjectInfo.ProjectPath, "./.fcm-errors/" + (unit.object as NSString).lastPathComponent + ".txt"),
+                    " 2>&1 || echo ", Q, unit.source, Q
                     ].joined()
             }
             let unitsFile = "\(ProjectInfo.ProjectPath)/.fcm-units.txt"
@@ -308,13 +318,14 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
             if jobs < 2 { jobs = 2 }
             let runnerFile = "\(ProjectInfo.ProjectPath)/.fcm-run.sh"
             cfile(atPath: runnerFile, withContent:
-                "#!/bin/sh\ncat '" + unitsFile + "' | xargs -P " + String(jobs) + " -I {} sh -c '{}'\n")
+                "#!/bin/sh\nrm -rf '" + errorDir + "' ; mkdir -p '" + errorDir + "'\n"
+                + "cat '" + unitsFile + "' | xargs -P " + String(jobs) + " -I {} sh -c '{}'\n")
 
-            EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -f " + FAIL_LOG + " '" + LINK_FLAG + "' ; "
-            EXEC += "sh '" + runnerFile + "' >> " + FAIL_LOG + " 2>&1 ; "
+            EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -f " + FAIL_LOG + " ; "
+            EXEC += "sh '" + runnerFile + "' > " + FAIL_LOG + " 2>&1 ; "
             EXEC += "rm -f '" + runnerFile + "' '" + unitsFile + "' ; "
         } else {
-            EXEC += "rm -f " + FAIL_LOG + " ; "
+            EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -f " + FAIL_LOG + " ; "
         }
 
         // 链接：收集所有 .o（含复用的）
@@ -324,7 +335,15 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         """
         EXEC += " ; "
         // 编译失败与链接失败分开报告，避免把链接错误说成"这些文件编译失败"
-        EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '以下文件编译失败：'; cat " + FAIL_LOG + "; fi ; "
+        // 先列出失败文件，再从各自的日志里提炼 error 行（忽略 warning，避免淹没）
+        EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '以下文件编译失败：'; cat " + FAIL_LOG + "; "
+        EXEC += "echo ''; echo '—— 错误摘要 ——'; "
+        EXEC += "cat " + FAIL_LOG + " | sed 's|^|./|' > /dev/null ; "
+        EXEC += "for f in .fcm-errors/*.txt; do "
+        EXEC += "[ -f \"$f\" ] || continue ; "
+        EXEC += "E=$(grep -m3 'error:' \"$f\" 2>/dev/null) ; "
+        EXEC += "if [ -n \"$E\" ]; then echo \"$(basename $f .txt):\"; echo \"$E\"; fi ; "
+        EXEC += "done ; fi ; "
         EXEC += "if [ -f '" + LINK_FLAG + "' ]; then echo '链接失败，请查看上面的 ld 输出'; rm -f '" + LINK_FLAG + "' ; exit 1 ; fi ; "
         EXEC += "if [ -s " + FAIL_LOG + " ]; then exit 1 ; fi"
         #elseif trollstore
