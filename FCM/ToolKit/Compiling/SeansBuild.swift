@@ -214,6 +214,25 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         localFrameworkFlags += " -F'" + fwDir + "' -framework " + item.name
     }
 
+    // Header Map（对应 Xcode 的 USE_HEADERMAP = YES，默认开启）
+    //
+    // Xcode 让工程内所有头文件都能用 #import "文件名.h" 直接引用，
+    // 不管它实际在哪个子目录 —— 靠的就是 header map。
+    // FCM 之前只有 HEADER_SEARCH_PATHS 里的目录，
+    // 所以 Air2/ 下那些头文件全部找不到（A2ThemeManager.h 等）。
+    //
+    // 这里生成等价的扁平索引目录并加入 -I。
+    let headerMap = buildHeaderMap(projectPath: ProjectInfo.ProjectPath,
+                                   ignorePrefixes: ["Resources", ".git"])
+    if headerMap.count > 0 {
+        headerFlags += " -I" + shellQuote(headerMap.directory)
+        var report = "Header Map：收录 \(headerMap.count) 个头文件"
+        if !headerMap.conflicts.isEmpty {
+            report += "（\(headerMap.conflicts.count) 个重名已跳过）"
+        }
+        _ = climessenger("xcode-config", report)
+    }
+
     // Xcode 工程里的 OTHER_LDFLAGS 直接透传：
     // 例如 "-Wl,-U,_terracotta_ios_start" 表示允许该符号未定义（运行时解析），
     // 以及 -L<path> -lmbedtls 这类库搜索与链接参数。
