@@ -57,7 +57,11 @@ green "    平台: $OS_NAME / $ARCH"
 # ---------- 2. 识别越狱类型 ----------
 green "==> [2/6] 识别越狱类型"
 if [ "$MODE" = "auto" ]; then
+    PRODUCT_NAME="$(sw_vers -productName 2>/dev/null || true)"
     if [ -x /var/jb/usr/bin/dpkg ] || [ -d /var/jb/usr/lib ]; then
+        MODE="rootless"
+    elif echo "$PRODUCT_NAME" | grep -qi "mac"; then
+        # macOS 上默认构建 rootless 包（对应 Makefile 的 all 目标）
         MODE="rootless"
     else
         MODE="roothide"
@@ -139,9 +143,11 @@ if [ ! -d "$SDK_DIR" ]; then
 fi
 green "    SDK: $SDK_DIR"
 
-if [ ! -d "$HEADERS_DIR" ]; then
+# include 是 git 子模块，checkout 后目录存在但为空；
+# 必须检查内容而不是只看目录是否存在。
+if [ -z "$(ls -A "$HEADERS_DIR" 2>/dev/null)" ]; then
     yellow "    克隆 theos/headers"
-    rm -rf "$REPO_DIR/.headers_tmp"
+    rm -rf "$HEADERS_DIR" "$REPO_DIR/.headers_tmp"
     git clone --depth 1 https://github.com/theos/headers.git "$REPO_DIR/.headers_tmp"
     mv "$REPO_DIR/.headers_tmp" "$HEADERS_DIR"
 fi

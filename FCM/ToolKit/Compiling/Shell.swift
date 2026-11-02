@@ -31,6 +31,16 @@
 import Foundation
 import Darwin
 
+/// waitpid 返回的是 wait status，不是退出码。
+/// 直接把它当退出码会得到 256/512 之类的值，日志里的“退出码”全部失真。
+func normalizedExitCode(_ status: Int32) -> Int {
+    let signal = Int(status & 0x7f)
+    if signal == 0 {
+        return Int((status >> 8) & 0xff)
+    }
+    return 128 + signal
+}
+
 #if jailbreak
 @discardableResult func shell(_ command: String, uid: uid_t? = 501, env: [String]? = []) -> Int {
     return runCommand("/usr/bin/bash", ["-e", "-c", command], (uid ?? 501), (env ?? []))
@@ -61,8 +71,8 @@ func runCommand(_ command: String, _ args: [String], _ uid: uid_t,_ env: [String
         return -1
     }
     var status: Int32 = 0
-    waitpid(pid, &status, 0)
-    return Int(status)
+    if waitpid(pid, &status, 0) == -1 { return -1 }
+    return normalizedExitCode(status)
 }
 
 #elseif trollstore
@@ -95,8 +105,8 @@ func runCommand(_ command: String, _ args: [String], _ uid: uid_t,_ env: [String
         return -1
     }
     var status: Int32 = 0
-    waitpid(pid, &status, 0)
-    return Int(status)
+    if waitpid(pid, &status, 0) == -1 { return -1 }
+    return normalizedExitCode(status)
 }
 #elseif stock
 @discardableResult func shell(_ command: String, uid: uid_t? = 501, env: [String]? = []) -> Int {

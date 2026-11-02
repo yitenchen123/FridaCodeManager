@@ -162,6 +162,7 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
                          projectPath: String,
                          appPath: String,
                          configuration: String,
+                         sdkPath: String = "",
                          log: (String) -> Void) -> Bool {
     guard !phases.isEmpty else { return true }
 
@@ -231,34 +232,41 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
 
         // 脚本写到文件再执行：内容可能有几十 KB，
         // 作为 bash -c 的单参数会超出 posix_spawn 限制。
-        let scriptFile = "\(global_container)/tmp/fcm-phase.sh"
+        let scriptFile = "\(global_container)/tmp/fcm-phase-\(UUID()).sh"
         _ = rm(scriptFile)
 
-        // 注入 Xcode 风格的表头，让 ${SRCROOT} 之类的变量可用
+        // 注入 Xcode 风格的表头，让 ${SRCROOT} 之类的变量可用。
+        // 值统一走 shellQuote：工程路径 / JDK 路径里出现空格或引号时不会截断脚本。
         var body = "#!/bin/sh\nset +e\n"
-        body += "export SRCROOT=\"\(projectPath)\"\n"
-        body += "export PROJECT_DIR=\"\(projectPath)\"\n"
-        body += "export PROJECT_FILE_PATH=\"\(projectPath)\"\n"
-        body += "export SRCROOT=\"\(projectPath)\"\n"
-        body += "export BUILD_DIR=\"\(buildDir)\"\n"
-        body += "export BUILT_PRODUCTS_DIR=\"\(productsDir)\"\n"
-        body += "export TARGET_BUILD_DIR=\"\(targetBuildDir)\"\n"
-        body += "export CONFIGURATION=\"\(configuration)\"\n"
+        body += "export SRCROOT=\(shellQuote(projectPath))\n"
+        body += "export PROJECT_DIR=\(shellQuote(projectPath))\n"
+        body += "export PROJECT_FILE_PATH=\(shellQuote(projectPath))\n"
+        body += "export BUILD_DIR=\(shellQuote(buildDir))\n"
+        body += "export BUILT_PRODUCTS_DIR=\(shellQuote(productsDir))\n"
+        body += "export TARGET_BUILD_DIR=\(shellQuote(targetBuildDir))\n"
+        body += "export CONFIGURATION=\(shellQuote(configuration))\n"
         body += "export ARCHS=\"arm64\"\n"
         body += "export PLATFORM_NAME=\"iphoneos\"\n"
         body += "export EFFECTIVE_PLATFORM_NAME=\"-iphoneos\"\n"
-        body += "export TARGET_NAME=\"\((appPath as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: ""))\"\n"
+        if !sdkPath.isEmpty {
+            body += "export SDKROOT=\(shellQuote(sdkPath))\n"
+        }
+        let targetName = (appPath as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: "")
+        body += "export TARGET_NAME=\(shellQuote(targetName))\n"
+        body += "export EXECUTABLE_NAME=\(shellQuote(targetName))\n"
+        body += "export PRODUCT_NAME=\(shellQuote(targetName))\n"
 
         // 把探测到的 JDK 传给脚本：Makefile 里的 BOOTJDK 与 JAVA_HOME 都会生效
         if let home = java.home, java.ready {
-            body += "export JAVA_HOME=\"\(home)\"\n"
-            body += "export BOOTJDK=\"\(home)\"\n"
+            body += "export JAVA_HOME=\(shellQuote(home))\n"
+            body += "export BOOTJDK=\(shellQuote(home))\n"
             let binDir = "\(home)/bin"
-            body += "export PATH=\"" + binDir + ":$PATH\"\n"
+            body += "export PATH=\(shellQuote(binDir)):\"$PATH\"\n"
         }
-        // shim 目录放最前，让 java_home / actool / codesign 等落到我们的实现
-        body += "export PATH=\"" + shimInstall.dir + ":/var/jb/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"\n"
-        body += "cd \"\(projectPath)\"\n"
+        // shim 目录放最前，让 java_home / actool / codesign 等落到我们的实现。
+        // 注意路径要跟随 jbroot，roothide 下不是 /var/jb。
+        body += "export PATH=\"\(shimInstall.dir):\(jbroot)/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"\n"
+        body += "cd \(shellQuote(projectPath))\n"
 
         // 软化脚本：替换 macOS 专属路径、降级 set -e、限制 Gradle 内存
         let softened = softenShellScript(phase.script, projectPath: projectPath)
@@ -273,9 +281,9 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
         body += "\n"
 
         cfile(atPath: scriptFile, withContent: body)
-        shell("chmod +x '\(scriptFile)'", uid: 501, env: [])
+        shell("chmod +x " + shellQuote(scriptFile), uid: 501, env: [])
 
-        let result = runCaptured("'\(scriptFile)'", uid: 501)
+        let result = runCaptured(shellQuote(scriptFile), uid: 501)
         _ = rm(scriptFile)
 
         if result.succeeded {

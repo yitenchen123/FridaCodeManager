@@ -54,22 +54,33 @@ func compileResources(from source: String,
                       projectName: String,
                       executable: String,
                       sdkPath: String,
-                      minimumOS: String) -> ResourceCompileReport {
+                      minimumOS: String,
+                      infoPlistSource: String = "",
+                      appIconName: String = "") -> ResourceCompileReport {
     let fm = FileManager.default
     var report = ResourceCompileReport()
 
-    guard let entries = try? fm.contentsOfDirectory(atPath: source) else {
-        report.warnings.append("资源目录不存在：\(source)")
-        return report
+    // Xcode 的 INFOPLIST_FILE 可能不在 Resources/ 下（导入的工程很常见）。
+    // 优先采用工程配置指定的文件，否则使用 FCM 约定的 Resources/Info.plist。
+    let plistSource = infoPlistSource.isEmpty ? "\(source)/Info.plist" : infoPlistSource
+    if fm.fileExists(atPath: plistSource) {
+        _ = cp(plistSource, "\(appBundle)/Info.plist")
+    } else {
+        report.warnings.append("找不到 Info.plist：\(plistSource)")
+    }
+
+    let entries = (try? fm.contentsOfDirectory(atPath: source)) ?? []
+    if entries.isEmpty {
+        report.warnings.append("资源目录不存在或为空：\(source)")
     }
 
     let ibtool = findXcrunTool("ibtool")
     let actool = findXcrunTool("actool")
 
-    for item in entries where item != ".DS_Store" && item != "DontTouchMe.plist" {
+    for item in entries where item != ".DS_Store" && item != "DontTouchMe.plist" && item != "Info.plist" {
         let src = "\(source)/\(item)"
         var isDir: ObjCBool = false
-        fm.fileExists(atPath: src, isDirectory: &isDir)
+        _ = fm.fileExists(atPath: src, isDirectory: &isDir)
         let lower = item.lowercased()
 
         // ---- storyboard ----
@@ -109,20 +120,30 @@ func compileResources(from source: String,
         if lower.hasSuffix(".xcassets") && isDir.boolValue {
             if let tool = actool {
                 let out = "\(appBundle)"
-                let command = "'\(tool)' '\(src)' --compile '\(out)'"
+                // 同一个 UUID 只生成一次；之前的写法生成与删除用了两个不同的 UUID，
+                // partial plist 会永久堆积在 tmp 里。
+                let partialPlist = "\(global_container)/tmp/asset-\(UUID()).plist"
+                var command = "'\(tool)' '\(src)' --compile '\(out)'"
                     + " --platform iphoneos --minimum-deployment-target \(minimumOS)"
-                    + " --app-icon AppIcon --output-partial-info-plist '\(global_container)/tmp/asset-\(UUID()).plist'"
-                if runCaptured(command, uid: 501).succeeded {
+                    + " --output-partial-info-plist '\(partialPlist)'"
+                // 只有目录里真的存在 AppIcon.appiconset 时才传 --app-icon，
+                // 否则 actool 会直接报错，资源反而编译不出来。
+                let icon = appIconName.isEmpty ? "AppIcon" : appIconName
+                if containsAppIconSet(in: src, name: icon) {
+                    command += " --app-icon \(icon)"
+                }
+                let result = runCaptured(command, uid: 501)
+                _ = rm(partialPlist)
+                if result.succeeded {
                     report.assetCatalogs += 1
-                    _ = rm("\(global_container)/tmp/asset-\(UUID()).plist")
                     continue
                 }
+                report.warnings.append("actool 编译失败，已原样拷贝：\(item)")
+            } else {
+                report.warnings.append("未安装 actool，Assets 未编译：\(item)")
             }
             _ = cp(src, "\(appBundle)/\(item)")
             report.copied += 1
-            if actool == nil {
-                report.warnings.append("未安装 actool，Assets 未编译：\(item)")
-            }
             continue
         }
 
@@ -144,6 +165,21 @@ func compileResources(from source: String,
     return report
 }
 
+/// Asset Catalog 里是否存在指定名字的 appiconset
+private func containsAppIconSet(in catalogPath: String, name: String) -> Bool {
+    let fm = FileManager.default
+    guard let enumerator = fm.enumerator(atPath: catalogPath) else { return false }
+    for case let entry as String in enumerator {
+        guard let last = entry.split(separator: "/").last,
+              last == Substring(name + ".appiconset") else { continue }
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: "\(catalogPath)/\(entry)", isDirectory: &isDir), isDir.boolValue {
+            return true
+        }
+    }
+    return false
+}
+
 /// 补齐 Info.plist 中 Xcode 会写入、但用户工程可能缺失的键；返回 CFBundlePackageType
 @discardableResult
 func fillInfoPlist(bundlePath: String,
@@ -151,10 +187,19 @@ func fillInfoPlist(bundlePath: String,
                    executable: String,
                    minimumOS: String) -> String {
     let plistPath = "\(bundlePath)/Info.plist"
-    var info = (NSDictionary(contentsOfFile: plistPath) as? [String: Any]) ?? [:]
+    var info = readPlistDictionary(at: plistPath) ?? [:]
 
     let packageType = (info["CFBundlePackageType"] as? String) ?? "APPL"
-    if info["CFBundleExecutable"] == nil { info["CFBundleExecutable"] = executable }
+
+    // CFBundleExecutable 必须与实际二进制文件名完全一致，
+    // 否则系统会认为 App 包损坏（老工程里常见 $(EXECUTABLE_NAME) 或旧名字）。
+    let resolvedExecutable = executable
+        .replacingOccurrences(of: "$(EXECUTABLE_NAME)", with: executable)
+        .replacingOccurrences(of: "${EXECUTABLE_NAME}", with: executable)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    if !resolvedExecutable.isEmpty {
+        info["CFBundleExecutable"] = resolvedExecutable
+    }
     if info["CFBundleName"] == nil { info["CFBundleName"] = projectName }
     if info["CFBundleDisplayName"] == nil { info["CFBundleDisplayName"] = projectName }
     if info["CFBundlePackageType"] == nil { info["CFBundlePackageType"] = packageType }
@@ -170,18 +215,20 @@ func fillInfoPlist(bundlePath: String,
         info["UISupportedInterfaceOrientations"] = ["UIInterfaceOrientationPortrait"]
     }
 
-    (info as NSDictionary).write(toFile: plistPath, atomically: true)
+    _ = writePlistDictionary(info, to: plistPath)
 
     // PkgInfo：Xcode 会生成，内容为 "APPL????"
     let pkgInfo = "\(bundlePath)/PkgInfo"
     if !FileManager.default.fileExists(atPath: pkgInfo) {
-        FileManager.default.createFile(atPath: pkgInfo, contents: Data((packageType + "????").utf8), attributes: nil)
+        _ = FileManager.default.createFile(atPath: pkgInfo,
+                                          contents: Data((packageType + "????").utf8),
+                                          attributes: nil)
     }
     return packageType
 }
 
 /// swift 模块名要求是合法标识符
-private func safeModuleName(_ name: String) -> String {
+func safeModuleName(_ name: String) -> String {
     let allowed = CharacterSet.alphanumerics
     var result = String(name.unicodeScalars.map { allowed.contains($0) ? String($0) : "_" }.joined())
     if let first = result.first, first.isNumber { result = "_" + result }

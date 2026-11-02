@@ -72,7 +72,7 @@ func OpenApp(_ bundleID: String) -> Void {
 
 func FindFilesStack(_ projectPath: String, _ fileExtensions: [String], _ ignore: [String]) -> [String] {
     do {
-        let (fileExtensionsSet, ignoreSet, allFiles) = (Set(fileExtensions), Set(ignore), try FileManager.default.subpathsOfDirectory(atPath: projectPath))
+        let (fileExtensionsSet, allFiles) = (Set(fileExtensions), try FileManager.default.subpathsOfDirectory(atPath: projectPath))
 
         var objCFiles: [String] = []
 
@@ -80,7 +80,8 @@ func FindFilesStack(_ projectPath: String, _ fileExtensions: [String], _ ignore:
             // 注意：ignore 里可能出现空字符串（splitAndTrim("") 会返回 [""]），
             // 而 hasPrefix("") 恒为 true —— 那会把所有文件都过滤掉，
             // 表现为"编译瞬间完成，一个文件都没编"。
-            let ignored = ignoreSet.contains(where: { !$0.isEmpty && file.hasPrefix($0) })
+            // 统一走 isPathIgnored，按目录边界匹配，避免 "build" 误伤 "builder.m"。
+            let ignored = isPathIgnored(file, prefixes: ignore)
             if fileExtensionsSet.contains(where: { file.hasSuffix($0) }) && !ignored {
                 // 这里只返回相对路径，引号统一在拼接命令时加，
                 // 否则会出现 /工程路径/'相对路径' 这种把引号包在中间的写法，

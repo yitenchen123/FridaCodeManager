@@ -22,6 +22,49 @@
 
 import Foundation
 
+// MARK: - 构建产物目录
+
+/// 构建时必须排除的目录。
+///
+/// 对应 Xcode 不会参与编译的目录：DerivedData / build / Pods 产物，
+/// 以及 FCM 自己的中间产物（Payload、clang、.fcm-cache）。
+/// 不排除它们会把上次构建的副本再次编译，表现为链接时 duplicate symbol，
+/// 或者“明明没改代码却重新编译了一堆文件”。
+let buildIgnoredDirectories: [String] = [
+    ".git", "build", "Build", "Payload", "clang", ".fcm-cache", ".fcm-errors",
+    "node_modules", "DerivedData", "Pods", ".build", "Resources"
+]
+
+/// 把 api.api 里的用户在忽略项与内置忽略项合并
+func makeBuildIgnoreList(_ userIgnore: String) -> [String] {
+    var result: [String] = []
+    for item in splitAndTrim(userIgnore) + buildIgnoredDirectories {
+        let trimmed = item.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if trimmed.isEmpty || trimmed == "." { continue }
+        if !result.contains(trimmed) { result.append(trimmed) }
+    }
+    return result
+}
+
+/// 判断相对路径是否落在忽略项内。
+/// 支持两种写法：
+///   - "Resources"     匹配任意层级下名为 Resources 的目录
+///   - "Sources/Generated" 匹配该前缀目录
+func isPathIgnored(_ relativePath: String, prefixes: [String]) -> Bool {
+    let path = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    for raw in prefixes {
+        let prefix = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if prefix.isEmpty { continue }
+        if prefix.contains("/") {
+            if path == prefix || path.hasPrefix(prefix + "/") { return true }
+        } else if path == prefix || path.hasPrefix(prefix + "/") ||
+                    path.split(separator: "/").contains(where: { $0 == Substring(prefix) }) {
+            return true
+        }
+    }
+    return false
+}
+
 // MARK: - 构建阶段
 
 enum BuildStage: String {
@@ -67,6 +110,9 @@ struct CommandResult {
 
 /// 执行 shell 命令并捕获输出。绝不静默失败。
 func runCaptured(_ command: String, uid: uid_t = 501, env: [String] = [], timeout: Int = 900) -> CommandResult {
+    // 所有临时文件都落在 container/tmp 下；这里必须确保目录存在，
+    // 否则重定向本身就会失败，命令还没跑就返回非零。
+    cfolder(atPath: "\(global_container)/tmp")
     let logPath = "\(global_container)/tmp/fcm-cmd-\(UUID()).log"
     let wrapped = command + " > '" + logPath + "' 2>&1"
     let code = shell(wrapped, uid: uid, env: env)
@@ -114,19 +160,82 @@ func detectToolchain() -> ToolchainStatus {
         return nil
     }
 
+    // rootless 下 jbroot = /var/jb；roothide 下 jbroot 是另一个前缀。
+    // 只写死 /var/jb 会在 roothide 设备上误报“找不到 clang/ldid”。
+    func candidates(_ names: [String]) -> [String] {
+        var paths: [String] = []
+        for name in names {
+            paths.append("\(jbroot)/usr/bin/\(name)")
+            paths.append("/var/jb/usr/bin/\(name)")
+            paths.append("/usr/bin/\(name)")
+        }
+        return paths
+    }
+
     var status = ToolchainStatus()
-    status.clangPath = find(["/var/jb/usr/bin/clang-14", "/usr/bin/clang-14",
-                             "/var/jb/usr/bin/clang", "/usr/bin/clang"])
-    status.swiftcPath = find(["/var/jb/usr/bin/swiftc", "/usr/bin/swiftc"])
-    status.ldidPath = find(["/var/jb/usr/bin/ldid", "/usr/bin/ldid"])
-    status.tarPath = find(["/var/jb/usr/bin/tar", "/usr/bin/tar"])
-    status.zipPath = find(["/var/jb/usr/bin/zip", "/usr/bin/zip"])
+    status.clangPath = find(candidates(["clang-14", "clang"]))
+    status.swiftcPath = find(candidates(["swiftc"]))
+    status.ldidPath = find(candidates(["ldid"]))
+    status.tarPath = find(candidates(["tar"]))
+    status.zipPath = find(candidates(["zip"]))
     return status
 }
 
 // MARK: - 产物校验
 
-/// 检查生成的 Mach-O 是否是目标架构
+/// CPU 类型 → 架构名（Mach-O 头里的 cputype）
+private func machoArchName(_ cpuType: UInt32) -> String? {
+    switch cpuType {
+    case 0x0100000C: return "arm64"
+    case 0x0200000C: return "arm64_32"
+    case 0x0000000C: return "armv7"
+    case 0x01000007: return "x86_64"
+    case 0x00000007: return "i386"
+    default: return nil
+    }
+}
+
+/// 读取 thin Mach-O 的 filetype（1=object, 2=execute, 6=dylib, 8=bundle）。
+/// 用于区分“需要嵌入 .app/Frameworks 的动态 framework”与静态 framework。
+func machoFileType(_ path: String) -> UInt32? {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { handle.closeFile() }
+    let header = handle.readData(ofLength: 16)
+    guard header.count == 16 else { return nil }
+    let bytes = [UInt8](header)
+    guard bytes[0] == 0xCF && bytes[1] == 0xFA && bytes[2] == 0xED && bytes[3] == 0xFE else {
+        return nil   // 静态库是 ar 归档，动态 fat 二进制这里也不处理
+    }
+    return UInt32(bytes[12]) | (UInt32(bytes[13]) << 8)
+        | (UInt32(bytes[14]) << 16) | (UInt32(bytes[15]) << 24)
+}
+
+/// 读取 Fat 二进制里的所有架构
+private func fatArchitectures(_ handle: FileHandle, is64: Bool) -> [String] {
+    let header = handle.readData(ofLength: 8)
+    guard header.count == 8 else { return [] }
+    let hb = [UInt8](header)
+    let count = Int((UInt32(hb[4]) << 24) | (UInt32(hb[5]) << 16) | (UInt32(hb[6]) << 8) | UInt32(hb[7]))
+    let entrySize = is64 ? 32 : 20
+    var archs: [String] = []
+
+    for index in 0..<min(count, 64) {
+        handle.seek(toFileOffset: UInt64(8 + index * entrySize))
+        let entry = handle.readData(ofLength: 4)
+        guard entry.count == 4 else { break }
+        let e = [UInt8](entry)
+        let cpu = (UInt32(e[0]) << 24) | (UInt32(e[1]) << 16) | (UInt32(e[2]) << 8) | UInt32(e[3])
+        if let name = machoArchName(cpu), !archs.contains(name) {
+            archs.append(name)
+        }
+    }
+    return archs
+}
+
+/// 检查产物是否是目标架构的真实 Mach-O。
+///
+/// 与之前只看 magic 的实现相比，这里会继续解析 cputype：
+/// 把 x86_64 / i386 的库误链进来说成 arm64，最终只会在设备启动时崩溃。
 func verifyMachO(_ path: String, expectedArch: String = "arm64") -> (Bool, String) {
     guard FileManager.default.fileExists(atPath: path) else {
         return (false, "文件不存在：\(path)")
@@ -144,15 +253,47 @@ func verifyMachO(_ path: String, expectedArch: String = "arm64") -> (Bool, Strin
     guard head.count == 8 else { return (false, "文件头不完整") }
 
     let bytes = [UInt8](head)
-    // Mach-O 64 位 magic：0xCFFAEDFE（小端，即文件中的 FE ED FA CF）
     let isMachO64LE = bytes[0] == 0xCF && bytes[1] == 0xFA && bytes[2] == 0xED && bytes[3] == 0xFE
-    let isFatLE    = bytes[0] == 0xCA && bytes[1] == 0xFE && bytes[2] == 0xBA && bytes[3] == 0xBE
-    let isFatBE    = bytes[0] == 0xBE && bytes[1] == 0xBA && bytes[2] == 0xFE && bytes[3] == 0xCA
+    let isMachO32LE = bytes[0] == 0xCE && bytes[1] == 0xFA && bytes[2] == 0xED && bytes[3] == 0xFE
+    let isFat32    = bytes[0] == 0xCA && bytes[1] == 0xFE && bytes[2] == 0xBA && bytes[3] == 0xBE
+    let isFat64    = bytes[0] == 0xCA && bytes[1] == 0xFE && bytes[2] == 0xBA && bytes[3] == 0xBF
 
-    guard isMachO64LE || isFatLE || isFatBE else {
+    guard isMachO64LE || isMachO32LE || isFat32 || isFat64 else {
         return (false, "不是有效的 Mach-O（文件头 \(head.map { String(format: "%02X", $0) }.joined(separator: " "))）")
     }
-    return (true, isFatLE || isFatBE ? "Universal" : expectedArch)
+
+    if isFat32 || isFat64 {
+        handle.seek(toFileOffset: 0)
+        let archs = fatArchitectures(handle, is64: isFat64)
+        if archs.isEmpty {
+            return (false, "Universal 二进制里没有可识别的 iOS 架构")
+        }
+        if !expectedArch.isEmpty && !archs.contains(expectedArch) {
+            return (false, "架构为 \(archs.joined(separator: "、"))，期望 \(expectedArch)")
+        }
+        return (true, "Universal（\(archs.joined(separator: "、"))）")
+    }
+
+    // thin Mach-O：cputype 在文件偏移 4，filetype 在偏移 12
+    handle.seek(toFileOffset: 0)
+    let header = handle.readData(ofLength: 16)
+    guard header.count == 16 else { return (false, "Mach-O 头不完整") }
+    let hb = [UInt8](header)
+    let cpu = UInt32(hb[4]) | (UInt32(hb[5]) << 8) | (UInt32(hb[6]) << 16) | (UInt32(hb[7]) << 24)
+    guard let arch = machoArchName(cpu) else {
+        return (false, String(format: "未知 CPU 类型 0x%08X", cpu))
+    }
+
+    // filetype：1 = object，2 = execute，6 = dylib
+    let fileType = UInt32(hb[12]) | (UInt32(hb[13]) << 8) | (UInt32(hb[14]) << 16) | (UInt32(hb[15]) << 24)
+    if fileType != 2 && fileType != 6 {
+        return (false, "Mach-O 类型为 \(fileType)，不是可执行文件")
+    }
+
+    if !expectedArch.isEmpty && arch != expectedArch {
+        return (false, "架构为 \(arch)，期望 \(expectedArch)")
+    }
+    return (true, arch)
 }
 
 /// 校验 .app 目录结构是否完整
@@ -163,7 +304,7 @@ func verifyAppBundle(_ appPath: String) -> (Bool, [String]) {
     let infoPlist = "\(appPath)/Info.plist"
     if !fm.fileExists(atPath: infoPlist) {
         problems.append("缺少 Info.plist")
-    } else if let info = NSDictionary(contentsOfFile: infoPlist) as? [String: Any] {
+    } else if let info = readPlistDictionary(at: infoPlist) {
         let exec = info["CFBundleExecutable"] as? String ?? ""
         if exec.isEmpty {
             problems.append("Info.plist 缺少 CFBundleExecutable")
@@ -214,13 +355,13 @@ enum SignMode {
 
 /// 用 ldid 签名，返回是否成功与错误
 func signBinary(_ binary: String, entitlements: String?, ldid: String) -> (Bool, String) {
-    var command = "'\(ldid)' -S"
+    // ldid 的 -S 后面可以直接跟 entitlements 文件；没有文件时只用 -S（ad-hoc）。
+    // 之前写成 -S- 会把它当成“从 stdin 读 entitlements”，在没有输入时会卡住/失败。
+    var command = shellQuote(ldid) + " -S"
     if let ent = entitlements, FileManager.default.fileExists(atPath: ent) {
-        command += "'\(ent)'"
-    } else {
-        command += "-"
+        command += shellQuote(ent)
     }
-    command += " '\(binary)'"
+    command += " " + shellQuote(binary)
 
     // 先以普通用户尝试，失败再提权（entitlements 文件常属于 root）
     var result = runCaptured(command, uid: 501)
@@ -268,13 +409,25 @@ func packageIPA(appBundle: String, output: String, zipPath: String?) -> (Bool, S
 
     _ = rm(output)
 
-    let zip = zipPath ?? "/usr/bin/zip"
-    let result = runCaptured("cd '\(workDir)' && '\(zip)' -r -q -y '\(output)' Payload", uid: 501)
-    let ok = result.succeeded && fm.fileExists(atPath: output)
-    _ = rm(workDir)
+    // 优先进程内 libzip：越狱设备不一定装了 zip，
+    // 而 libzip.a 已经链接进 FCM，功能完全等价且不受 PATH 影响。
+    var failureText = ""
+    if let zip = zipPath, FileManager.default.isExecutableFile(atPath: zip) {
+        let result = runCaptured("cd '\(workDir)' && '\(zip)' -r -q -y '\(output)' Payload", uid: 501)
+        failureText = result.output
+        if result.succeeded && fm.fileExists(atPath: output) {
+            _ = rm(workDir)
+            return (true, "")
+        }
+    }
 
-    if !ok {
-        return (false, result.output.isEmpty ? "zip 打包失败（退出码 \(result.code)）" : result.output)
+    let libzipCode = libzip_zip(payload, output, true)
+    _ = rm(workDir)
+    guard libzipCode == 0, fm.fileExists(atPath: output) else {
+        if !failureText.isEmpty {
+            return (false, failureText)
+        }
+        return (false, "zip 与 libzip 都无法生成 ipa（libzip 返回 \(libzipCode)）")
     }
     return (true, "")
 }

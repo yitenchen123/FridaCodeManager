@@ -30,8 +30,30 @@
 
 import Foundation
 
+/// 读取 plist（统一走 PropertyListSerialization，避免已废弃的 NSDictionary 构造器）
+func readPlistDictionary(at path: String) -> [String: Any]? {
+    guard let data = FileManager.default.contents(atPath: path) else { return nil }
+    return (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil))
+        as? [String: Any]
+}
+
+/// 原子写入 XML plist
+@discardableResult
+func writePlistDictionary(_ dictionary: [String: Any], to path: String) -> Bool {
+    do {
+        let data = try PropertyListSerialization.data(fromPropertyList: dictionary,
+                                                      format: .xml,
+                                                      options: 0)
+        try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        return true
+    } catch {
+        print("Error writing plist: \(error)")
+        return false
+    }
+}
+
 func rplist(forKey key: String, plistPath: String) -> String? {
-    guard let plistDict = NSDictionary(contentsOfFile: plistPath) as? [String: Any] else {
+    guard let plistDict = readPlistDictionary(at: plistPath) else {
         print("Error reading plist file at \(plistPath)")
         return nil
     }
@@ -45,10 +67,10 @@ func rplist(forKey key: String, plistPath: String) -> String? {
 }
 
 func wplist(value: Any, forKey key: String, plistPath: String) -> Int {
-    var plistDict = (NSDictionary(contentsOfFile: plistPath) as? [String: Any]) ?? [:]
+    var plistDict = readPlistDictionary(at: plistPath) ?? [:]
     plistDict[key] = value
     
-    if (plistDict as NSDictionary).write(toFile: plistPath, atomically: true) {
+    if writePlistDictionary(plistDict, to: plistPath) {
         print("Value successfully written to \(plistPath) for key: \(key)")
     } else {
         print("Error writing value to \(plistPath) for key: \(key)")
@@ -124,14 +146,14 @@ func aiaplist(item: Any, aname arrayName: String, path plistPath: String) -> Int
 }
 
 func rmplist(key: String, plistPath: String) -> Int {
-    guard let dict = NSMutableDictionary(contentsOfFile: plistPath) else {
+    guard var dict = readPlistDictionary(at: plistPath) else {
         print("Error: Unable to load plist file at \(plistPath)")
         return 2
     }
 
-    dict.removeObject(forKey: key)
+    dict.removeValue(forKey: key)
     
-    if dict.write(toFile: plistPath, atomically: true) {
+    if writePlistDictionary(dict, to: plistPath) {
         print("Key '\(key)' deleted successfully from \(plistPath)")
     } else {
         print("Error: Unable to write changes to \(plistPath)")

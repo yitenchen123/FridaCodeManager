@@ -121,7 +121,7 @@ func runBuildDiagnostics(projectPath: String) -> BuildDiagnosticsReport {
     }
 
     // ---- 4) 静态库平台 ----
-    let ignoreList = ["Resources", ".git", "build", "Payload", "clang"]
+    let ignoreList = makeBuildIgnoreList("")
     let libs = collectIOSStaticLibraries(projectPath: projectPath, ignorePrefixes: ignoreList)
     let xcfLibs = collectIOSStaticFromXCFrameworks(projectPath: projectPath, ignorePrefixes: ignoreList)
     let allLibs = libs + xcfLibs
@@ -129,8 +129,10 @@ func runBuildDiagnostics(projectPath: String) -> BuildDiagnosticsReport {
 
     // 探测是否存在被排除的非 iOS 库
     if let all = try? fm.subpathsOfDirectory(atPath: projectPath) {
-        let foreign = all.filter { $0.hasSuffix(".a") && !allLibs.contains($0) }
-            .filter { !$0.contains("Resources") }
+        let ignored = makeBuildIgnoreList("")
+        let foreign = all.filter {
+            $0.hasSuffix(".a") && !allLibs.contains($0) && !isPathIgnored($0, prefixes: ignored)
+        }
         if !foreign.isEmpty {
             let sample = foreign.prefix(3).joined(separator: "、")
             report.info("已排除非 iOS 静态库 \(foreign.count) 个（如 \(sample)）")
@@ -204,8 +206,10 @@ func checkMissingHeaders(projectPath: String, config: XcodeBuildConfig) -> [Stri
     guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else { return [] }
 
     // 收集工程内所有头文件（相对路径 → 目录）
-    var headerDirs = Set<String>()
-    for file in all where file.hasSuffix(".h") {
+    let ignored = makeBuildIgnoreList("")
+    var headerDirs: Set<String> = [""]
+    for file in all where file.hasSuffix(".h") || file.hasSuffix(".hh") || file.hasSuffix(".hpp") {
+        if isPathIgnored(file, prefixes: ignored) { continue }
         let dir = (file as NSString).deletingLastPathComponent
         headerDirs.insert(dir)
     }

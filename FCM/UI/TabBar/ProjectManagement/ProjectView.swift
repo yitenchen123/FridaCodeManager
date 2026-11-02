@@ -142,8 +142,12 @@ struct ProjectView: View {
             ShowAlert(UIAlertController(title: "正在生成 Xcode 工程…", message: "", preferredStyle: .alert))
 
             let deps = loadProjectDependencies(projectPath: Project.ProjectPath)
-            let frameworks = deps.systemFrameworks.map { XcodeFrameworkRef(name: $0, path: "System/Library/Frameworks/\($0).framework", isSystem: true) }
-                + deps.localFrameworks.map { XcodeFrameworkRef(name: $0, path: $0, isSystem: false) }
+            let frameworks: [XcodeFrameworkRef] = deps.systemFrameworks.map {
+                XcodeFrameworkRef(name: $0, path: "System/Library/Frameworks/\($0).framework", isSystem: true)
+            } + deps.localFrameworks.enumerated().compactMap { index, name in
+                guard index < deps.localFrameworkPaths.count else { return nil }
+                return XcodeFrameworkRef(name: name, path: deps.localFrameworkPaths[index], isSystem: false)
+            }
 
             var spec = buildProjectSpec(projectName: Project.Executable,
                                         projectPath: Project.ProjectPath,
@@ -214,8 +218,12 @@ struct ProjectView: View {
         #endif
         let modname = project.Executable.replacingOccurrences(of: " ", with: "_")
         if result == 0 {
-            _ = rm("\(global_container)/tmp/\(modname).ipa")
-            _ = mv("\(global_documents)/\(project.Name)/ts.ipa", "\(global_container)/tmp/\(modname).ipa")
+            // build() 生成的是 <工程目录>/<Executable>.ipa；
+            // ts.ipa 只在“安装”流程里临时创建，导出时不能依赖它。
+            let exported = "\(project.ProjectPath)/\(modname).ipa"
+            let destination = "\(global_container)/tmp/\(modname).ipa"
+            _ = rm(destination)
+            _ = mv(exported, destination)
         }
         return result
     }

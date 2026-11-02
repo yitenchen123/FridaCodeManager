@@ -51,11 +51,12 @@ func quotedList(_ base: String, _ items: [String]) -> String {
 /// 判定规则（任一满足即加入 -I）：
 ///   1. 目录名是 include / includes / Headers / Public / include_debug
 ///   2. 目录里直接存在 .h 文件（业务目录，例如 Natives/Support 同时放 .m 和 .h）
-func discoverHeaderPaths(_ projectPath: String) -> String {
+func discoverHeaderDirectories(_ projectPath: String) -> [String] {
     let fm = FileManager.default
     var paths: [String] = [projectPath]
+    let ignored = buildIgnoredDirectories + ["java_runtimes", "depends"]
 
-    guard let en = fm.enumerator(atPath: projectPath) else { return "" }
+    guard let en = fm.enumerator(atPath: projectPath) else { return paths }
     var count = 0
     for case let item as String in en {
         count += 1
@@ -65,15 +66,13 @@ func discoverHeaderPaths(_ projectPath: String) -> String {
         let full = "\(projectPath)/\(item)"
         guard fm.fileExists(atPath: full, isDirectory: &isDir), isDir.boolValue else { continue }
 
-        let name = (item as NSString).lastPathComponent
         // 跳过构建产物、版本控制、以及明显与源码无关的目录
-        if name == ".git" || name == "build" || name == "Payload" || name == "clang" ||
-           name == "node_modules" || name.hasPrefix(".") ||
-           name == "DerivedData" || name == "java_runtimes" || name == "depends" {
+        if isPathIgnored(item, prefixes: ignored) {
             en.skipDescendants()
             continue
         }
 
+        let name = (item as NSString).lastPathComponent
         let lower = name.lowercased()
         if lower == "include" || lower == "includes" || lower == "headers" ||
            lower == "include_debug" || lower == "public" {
@@ -83,19 +82,28 @@ func discoverHeaderPaths(_ projectPath: String) -> String {
 
         // 目录里直接含 .h 文件的，也当作头文件目录
         let children = (try? fm.contentsOfDirectory(atPath: full)) ?? []
-        if children.contains(where: { $0.hasSuffix(".h") }) {
+        if children.contains(where: { $0.hasSuffix(".h") || $0.hasSuffix(".hh") || $0.hasSuffix(".hpp") }) {
             paths.append(full)
         }
     }
 
-    // 去重并生成 -I 参数（路径可能含空格，用单引号包住）
+    // 去重
     var seen = Set<String>()
-    var flags = ""
-    for path in paths where !seen.contains(path) {
-        seen.insert(path)
-        flags += " -I'\(path)'"
-    }
-    return flags
+    return paths.filter { seen.insert($0).inserted }
+}
+
+func discoverHeaderPaths(_ projectPath: String) -> String {
+    return discoverHeaderDirectories(projectPath)
+        .map { " -I" + shellQuote($0) }
+        .joined()
+}
+
+/// Swift 通过 Clang importer 读取 Objective-C 头文件，
+/// 头文件搜索路径必须经 -Xcc 转发；直接传 -I 给 swiftc 会被当成 Swift 模块路径。
+func swiftClangImporterFlags(headerDirectories: [String]) -> String {
+    return headerDirectories
+        .map { " -Xcc -I" + shellQuote($0) }
+        .joined()
 }
 
 /// 把 iPhoneOS16.4.sdk 转成可直接比较的字符串（各段补零到 3 位，字典序 == 版本序）
@@ -181,6 +189,11 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     let bashenv: [String] = ["SDKROOT=\(info[3])","CPATH=\(Bundle.main.bundlePath)/include","LIBRARY_PATH=\(info[3])/usr/lib","FRAMEWORK_PATH=/System/Library/Frameworks:/System/Library/PrivateFrameworks","HOME=\(global_container)/.cache/.\(ProjectInfo.SDK)"]
     #endif
 
+    // 工具链路径只探测一次：设备上可能只有 clang（没有 clang-14 这个别名），
+    // 硬编码 "clang-14" 会让诊断通过但编译失败。
+    let toolchain = detectToolchain()
+    let clangCommand = shellQuote(toolchain.clangPath ?? "clang-14")
+
     //Processing API
     var apiextension: ext = ext(build:"",build_sub: "",bef: "", aft:"", ign: "")
     if !info[7].isEmpty {
@@ -190,91 +203,8 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     print("FridaCodeManager \(global_version)\n ")
     _ = climessenger("info","App Name: \(ProjectInfo.Executable)\nBundleID: \(ProjectInfo.BundleID)\nSDK:      \(ProjectInfo.SDK)")
 
-    //finding code files
-    messenger(status,progress,"finding code files",0.1)
-    let ignoreList = splitAndTrim(apiextension.ign) + ["Resources"]
-    let (MFiles, SwiftFiles) = (
-        FindFilesStack(ProjectInfo.ProjectPath, [".m", ".c", ".mm", ".cpp"], ignoreList),
-        FindFilesStack(ProjectInfo.ProjectPath, [".swift"], ignoreList)
-    )
-    // 静态库来源有两处：普通 .a，以及 .xcframework 里的设备切片
-    let AFiles = (collectIOSStaticLibraries(projectPath: ProjectInfo.ProjectPath, ignorePrefixes: ignoreList)
-                + collectIOSStaticFromXCFrameworks(projectPath: ProjectInfo.ProjectPath, ignorePrefixes: ignoreList)).sorted()
-
-    //finding frameworks
-    messenger(status,progress,"finding frameworks", 0.15)
-    let frameworks = !MFiles.isEmpty && FileManager.default.fileExists(atPath: info[3]) ? findFrameworks(in: URL(fileURLWithPath: ProjectInfo.ProjectPath), SDKPath: info[3], ignorePaths: splitAndTrim(apiextension.ign) + ["Resources"]) : []
-    // 工程自带的 .framework（如 terracotta）：需要额外传 -F 搜索路径，
-    // 否则符号会缺失（_terracotta_ios_* 之类）。
-    let localFrameworks = collectIOSFrameworks(projectPath: ProjectInfo.ProjectPath,
-                                               ignorePrefixes: splitAndTrim(apiextension.ign) + ["Resources"])
-    var localFrameworkFlags = ""
-    for item in localFrameworks {
-        let fwDir = ((item.path as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
-        localFrameworkFlags += " -F'" + fwDir + "' -framework " + item.name
-    }
-
-    // Xcode 工程里的 OTHER_LDFLAGS 直接透传：
-    // 例如 "-Wl,-U,_terracotta_ios_start" 表示允许该符号未定义（运行时解析），
-    // 以及 -L<path> -lmbedtls 这类库搜索与链接参数。
-    // 优先读取 .xcodeproj 里的真实构建设置。
-    // Xcode 用 HEADER_SEARCH_PATHS / OTHER_LDFLAGS 精确控制编译，
-    // 靠扫描目录猜测必然对不上，这是之前链路反复失败的根因。
-    let xcodeConfig = loadXcodeBuildConfig(projectPath: ProjectInfo.ProjectPath)
-    var headerFlags = ""
-    if xcodeConfig.sourceFound && !xcodeConfig.headerSearchPaths.isEmpty {
-        headerFlags = clangIncludeFlags(from: xcodeConfig)
-        var report = "读取 Xcode 工程配置：头文件路径 \(xcodeConfig.headerSearchPaths.count) 个"
-        report += "，链接参数 \(xcodeConfig.otherLDFlags.count) 条"
-        _ = climessenger("xcode-config", report)
-        for path in xcodeConfig.headerSearchPaths.prefix(10) {
-            _ = climessenger("xcode-config", "  -I " + path.replacingOccurrences(of: ProjectInfo.ProjectPath + "/", with: ""))
-        }
-    } else {
-        // 没有工程配置时退回目录扫描
-        headerFlags = discoverHeaderPaths(ProjectInfo.ProjectPath)
-        _ = climessenger("xcode-config", "未找到 .xcodeproj 配置，改用目录扫描")
-    }
-
-    // Header Map（对应 Xcode 的 USE_HEADERMAP = YES，默认开启）
-    //
-    // Xcode 让工程内所有头文件都能用 #import "文件名.h" 直接引用，
-    // 不管它实际在哪个子目录 —— 靠的就是 header map。
-    // FCM 之前只有 HEADER_SEARCH_PATHS 里的目录，
-    // 所以 Air2/ 下那些头文件全部找不到（A2ThemeManager.h 等）。
-    //
-    // 这里生成等价的扁平索引目录并加入 -I。
-    let headerMap = buildHeaderMap(projectPath: ProjectInfo.ProjectPath,
-                                   ignorePrefixes: ["Resources", ".git"])
-    if headerMap.count > 0 {
-        headerFlags += " -I" + shellQuote(headerMap.directory)
-        var report = "Header Map：收录 \(headerMap.count) 个头文件"
-        if !headerMap.conflicts.isEmpty {
-            report += "（\(headerMap.conflicts.count) 个重名已跳过）"
-        }
-        _ = climessenger("xcode-config", report)
-    }
-
-    let xcodeLinkFlags = clangLinkFlags(from: xcodeConfig)
-    let defineFlags = clangDefineFlags(from: xcodeConfig)
-    // 语言标准与优化级别：GCC_C_LANGUAGE_STANDARD / GCC_OPTIMIZATION_LEVEL
-    let codegenFlags = clangCodegenFlags(from: xcodeConfig)
-    // 动态库搜索路径：LD_RUNPATH_SEARCH_PATHS
-    let runpathFlags = clangRunpathFlags(from: xcodeConfig)
-
-    if !codegenFlags.isEmpty {
-        _ = climessenger("xcode-config", "编译选项：" + codegenFlags)
-    }
-
-    let frameflags = (frameworks.map { "-framework \($0)" }.joined(separator: " ")
-                    + localFrameworkFlags
-                    + xcodeLinkFlags
-                    + runpathFlags)
-
-    // 如果工程带 .github/workflows，优先执行其中的依赖准备步骤。
-    // 很多项目的第三方库（mbedtls / JRE / 预编译 dylib）不进 git，
-    // 而是在 CI 里现下，直接编译必然缺头文件。
-    // Swift Package 依赖：先尝试解析，失败不阻断（设备可能没装 swift）
+    // Xcode 的第一步是解析依赖（SPM / CocoaPods / CI 脚本），然后才扫描源文件。
+    // FCM 也必须先做，否则 CI 现下的头文件、预编译库会被后面的扫描漏掉。
     if hasSwiftPackageDependencies(projectPath: ProjectInfo.ProjectPath) {
         _ = resolveSwiftPackages(projectPath: ProjectInfo.ProjectPath) { line in
             _ = climessenger("spm", line)
@@ -287,59 +217,279 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         _ = runCIPrepSteps(prepSteps, projectPath: ProjectInfo.ProjectPath) { line in
             _ = climessenger("ci-prep", line)
         }
-        // 依赖下载完可能新增了头文件目录，重新扫描
+    }
+
+    //finding code files
+    messenger(status,progress,"finding code files",0.1)
+    // 内置忽略项 + api.api 的忽略项；避免把 Payload/clang/build 里的旧副本也编进去
+    let ignoreList = makeBuildIgnoreList(apiextension.ign)
+    let (MFiles, SwiftFiles) = (
+        FindFilesStack(ProjectInfo.ProjectPath, [".m", ".c", ".mm", ".cpp", ".cc", ".cxx", ".s"], ignoreList),
+        FindFilesStack(ProjectInfo.ProjectPath, [".swift"], ignoreList)
+    )
+    // 静态库来源有两处：普通 .a，以及 .xcframework 里的设备切片
+    let AFiles = (collectIOSStaticLibraries(projectPath: ProjectInfo.ProjectPath, ignorePrefixes: ignoreList)
+                + collectIOSStaticFromXCFrameworks(projectPath: ProjectInfo.ProjectPath, ignorePrefixes: ignoreList)).sorted()
+
+    //finding frameworks
+    // Swift 代码也会 import 系统框架，不能只在有 .m 文件时才扫描。
+    messenger(status,progress,"finding frameworks", 0.15)
+    let frameworks = FileManager.default.fileExists(atPath: info[3])
+        ? findFrameworks(in: URL(fileURLWithPath: ProjectInfo.ProjectPath),
+                         SDKPath: info[3],
+                         ignorePaths: ignoreList)
+        : []
+    // 工程自带的 .framework（如 terracotta）：需要额外传 -F 搜索路径，
+    // 否则符号会缺失（_terracotta_ios_* 之类）。
+    let localFrameworks = collectIOSFrameworks(projectPath: ProjectInfo.ProjectPath,
+                                               ignorePrefixes: ignoreList)
+    var localFrameworkFlags = ""
+    for item in localFrameworks {
+        let fwDir = ((item.path as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
+        localFrameworkFlags += " -F" + shellQuote(fwDir) + " -framework " + shellQuote(item.name)
+    }
+
+    // Xcode 工程里的 OTHER_LDFLAGS 直接透传：
+    // 例如 "-Wl,-U,_terracotta_ios_start" 表示允许该符号未定义（运行时解析），
+    // 以及 -L<path> -lmbedtls 这类库搜索与链接参数。
+    // 优先读取 .xcodeproj 里的真实构建设置。
+    // Xcode 用 HEADER_SEARCH_PATHS / OTHER_LDFLAGS 精确控制编译，
+    // 靠扫描目录猜测必然对不上，这是之前链路反复失败的根因。
+    let xcodeConfig = loadXcodeBuildConfig(projectPath: ProjectInfo.ProjectPath)
+    var headerFlags = ""
+    // swiftc 的 Clang importer 需要同一组路径，但必须经 -Xcc 转发
+    var swiftHeaderFlags = ""
+    if xcodeConfig.sourceFound &&
+        (!xcodeConfig.headerSearchPaths.isEmpty ||
+         !xcodeConfig.userHeaderSearchPaths.isEmpty ||
+         !xcodeConfig.systemHeaderSearchPaths.isEmpty) {
+        headerFlags = clangIncludeFlags(from: xcodeConfig)
+        for path in xcodeConfig.userHeaderSearchPaths where isValidShellArgument(path) {
+            swiftHeaderFlags += " -Xcc -iquote" + shellQuote(path)
+        }
+        for path in xcodeConfig.headerSearchPaths where isValidShellArgument(path) {
+            swiftHeaderFlags += " -Xcc -I" + shellQuote(path)
+        }
+        for path in xcodeConfig.systemHeaderSearchPaths where isValidShellArgument(path) {
+            swiftHeaderFlags += " -Xcc -isystem" + shellQuote(path)
+        }
+        var report = "读取 Xcode 工程配置：头文件路径 \(xcodeConfig.headerSearchPaths.count) 个"
+        report += "，链接参数 \(xcodeConfig.otherLDFlags.count) 条"
+        _ = climessenger("xcode-config", report)
+        for path in xcodeConfig.headerSearchPaths.prefix(10) {
+            _ = climessenger("xcode-config", "  -I " + path.replacingOccurrences(of: ProjectInfo.ProjectPath + "/", with: ""))
+        }
+    } else {
+        // 没有工程配置时退回目录扫描
+        let headerDirectories = discoverHeaderDirectories(ProjectInfo.ProjectPath)
+        headerFlags = headerDirectories.map { " -I" + shellQuote($0) }.joined()
+        swiftHeaderFlags = swiftClangImporterFlags(headerDirectories: headerDirectories)
+        _ = climessenger("xcode-config", "未找到 .xcodeproj 配置，改用目录扫描")
+    }
+    // bridging header 经常 import 工程根目录里的头文件，根目录始终加入 importer 搜索路径
+    swiftHeaderFlags += " -Xcc -I" + shellQuote(ProjectInfo.ProjectPath)
+
+    // Header Map（对应 Xcode 的 USE_HEADERMAP = YES，默认开启）
+    //
+    // Xcode 让工程内所有头文件都能用 #import "文件名.h" 直接引用，
+    // 不管它实际在哪个子目录 —— 靠的就是 header map。
+    // FCM 之前只有 HEADER_SEARCH_PATHS 里的目录，
+    // 所以 Air2/ 下那些头文件全部找不到（A2ThemeManager.h 等）。
+    //
+    // 这里生成等价的扁平索引目录并加入 -I。
+    let headerMap = buildHeaderMap(projectPath: ProjectInfo.ProjectPath,
+                                   ignorePrefixes: ignoreList)
+    if headerMap.count > 0 {
+        headerFlags += " -I" + shellQuote(headerMap.directory)
+        swiftHeaderFlags += " -Xcc -I" + shellQuote(headerMap.directory)
+        var report = "Header Map：收录 \(headerMap.count) 个头文件"
+        if !headerMap.conflicts.isEmpty {
+            report += "（\(headerMap.conflicts.count) 个重名已跳过）"
+        }
+        _ = climessenger("xcode-config", report)
+    }
+
+    let xcodeLinkFlags = clangLinkFlags(from: xcodeConfig)
+    let defineFlags = clangDefineFlags(from: xcodeConfig)
+    let otherCFlags = clangOtherCFlags(from: xcodeConfig)
+    let optimizationFlags = clangOptimizationFlags(from: xcodeConfig)
+    let objcMessagingFlags = clangObjCMessagingFlags(from: xcodeConfig)
+    // 动态库搜索路径：LD_RUNPATH_SEARCH_PATHS
+    var runpathFlags = clangRunpathFlags(from: xcodeConfig)
+
+    if !otherCFlags.isEmpty {
+        _ = climessenger("xcode-config", "OTHER_CFLAGS：" + otherCFlags)
+    }
+
+    // Xcode 默认 LD_RUNPATH_SEARCH_PATHS 含 @executable_path/Frameworks；
+    // 工程自带动态 framework 时缺了这条会在启动时 dyld 找不到库。
+    if runpathFlags.isEmpty {
+        runpathFlags = " -Wl,-rpath,@executable_path/Frameworks"
+    }
+
+    let frameflags = (frameworks.map { "-framework " + shellQuote($0) }.joined(separator: " ")
+                    + localFrameworkFlags
+                    + xcodeLinkFlags
+                    + runpathFlags)
+
+    // swiftc 不接受 -Wl, / -ObjC 这类 clang 形式，必须换成 -Xlinker；
+    // 系统框架与工程自带 framework 的 -framework/-F 形式两边通用。
+    var swiftFrameworkLinkFlags = frameworks.map { "-framework " + shellQuote($0) }.joined(separator: " ")
+        + localFrameworkFlags
+        + swiftLinkFlags(from: xcodeConfig)
+    if xcodeConfig.runpathSearchPaths.isEmpty {
+        swiftFrameworkLinkFlags += " -Xlinker -rpath -Xlinker " + shellQuote("@executable_path/Frameworks")
     }
 
     //setting up command
     messenger(status,progress,"setting up compiler",0.2)
 
-    // 现代 Objective-C 基本都用 ARC；不开 ARC 时任何 __weak 都会直接报错
-    // （cannot create __weak reference in file using manual reference counting）。
-    // 如需关闭，在工程的 api.api 里写 <noarc>true</noarc>。
-    // 目标架构：依据 ARCHS / VALID_ARCHS / EXCLUDED_ARCHITECTURES
+    // 目标架构：iOS 设备构建只接受 ARM。
+    // 旧实现同时传 -arch x86_64 和 -target arm64-apple-ios，两者会直接冲突。
     let targetArchs = resolveTargetArchitectures(from: xcodeConfig)
-    var archFlags = ""
-    for arch in targetArchs {
-        archFlags += " -arch " + arch
-    }
+    let targetArch = targetArchs.first(where: { $0 == "arm64" }) ?? targetArchs[0]
+    let targetTriple = "\(targetArch)-apple-ios\(ProjectInfo.TG)"
     if targetArchs != ["arm64"] {
-        _ = climessenger("xcode-config", "目标架构：" + targetArchs.joined(separator: ", "))
+        _ = climessenger("xcode-config", "目标架构：" + targetArchs.joined(separator: ", ") + "，使用 " + targetArch)
     }
 
-    var objcFlags = " -fobjc-arc -fobjc-link-runtime" + headerFlags + defineFlags + codegenFlags + archFlags
-    // Xcode 工程里显式关闭 ARC 时以工程配置为准
-    if !xcodeConfig.enableObjCARC || apiextension.noarc {
-        objcFlags = " -fno-objc-arc"
+    // 可执行文件名遵循 Xcode 规则：
+    //   PRODUCT_NAME → EXECUTABLE_NAME，再拼 EXECUTABLE_PREFIX / EXECUTABLE_SUFFIX
+    let executableName = resolveExecutableName(ProjectInfo.Executable, config: xcodeConfig)
+    let finalExecutable = xcodeConfig.executablePrefix + executableName + xcodeConfig.executableSuffix
+    if finalExecutable != ProjectInfo.Executable {
+        _ = climessenger("build-plan", "可执行文件名：\(finalExecutable)（依据 PRODUCT_NAME / EXECUTABLE_*）")
+    }
+    let builtBinary = "\(info[1])/\(finalExecutable)"
+
+    // 现代 Objective-C 基本都用 ARC；不开 ARC 时任何 __weak 都会直接报错。
+    // 如需关闭，在工程的 api.api 里写 <noarc>true</noarc>。
+    let usesARC = xcodeConfig.enableObjCARC && !apiextension.noarc
+    let arcFlag = usesARC ? " -fobjc-arc" : " -fno-objc-arc"
+    let modulesFlag = xcodeConfig.enableModules ? " -fmodules" : ""
+    let sdkPathFlag = " -isysroot " + shellQuote(info[3])
+    let macroFlag = ProjectInfo.Macro.isEmpty ? "" : " -D" + shellQuote(ProjectInfo.Macro)
+
+    func isObjCSource(_ path: String) -> Bool {
+        let ext = (path as NSString).pathExtension.lowercased()
+        return ext == "m" || ext == "mm"
+    }
+    func isCppSource(_ path: String) -> Bool {
+        let ext = (path as NSString).pathExtension.lowercased()
+        return ext == "mm" || ext == "cpp" || ext == "cc" || ext == "cxx"
+    }
+    func isAsmSource(_ path: String) -> Bool {
+        return (path as NSString).pathExtension.lowercased() == "s"
     }
 
-    // 双引号常量：直接写转义引号在多层的 Swift 字符串里极易出错，统一用 Q
-    let Q = String(Character(Unicode.Scalar(34)))
+    // 语言标准必须按文件类型分开，否则 -std=gnu++17 会把 .c 直接编失败。
+    func compileFlags(for source: String) -> String {
+        var flags = macroFlag + headerFlags + defineFlags + otherCFlags
+        flags += optimizationFlags + objcMessagingFlags + sdkPathFlag
+        if isObjCSource(source) { flags += arcFlag }
+        if !isAsmSource(source) {
+            flags += clangLanguageStandardFlags(from: xcodeConfig, forCpp: isCppSource(source))
+        }
+        flags += modulesFlag
+        return flags
+    }
+
+    let hasCppSources = MFiles.contains(where: { isCppSource($0) })
+    let cxxRuntimeFlag = hasCppSources ? " -lc++" : ""
+
+    // Swift 通过 Clang importer 读头文件；宏也必须经 -Xcc 让它可见。
+    var swiftImporterDefineFlags = ""
+    if !ProjectInfo.Macro.isEmpty {
+        swiftImporterDefineFlags += " -Xcc -D" + shellQuote(ProjectInfo.Macro)
+    }
+    for raw in xcodeConfig.preprocessorDefinitions where isValidShellArgument(raw) {
+        swiftImporterDefineFlags += " -Xcc -D" + shellQuote(raw)
+    }
+    let swiftMacroFlag = ProjectInfo.Macro.isEmpty ? "" : " -D" + shellQuote(ProjectInfo.Macro)
+    let swiftOptimization: String = {
+        let raw = xcodeConfig.swiftOptimizationLevel
+        if !raw.isEmpty {
+            return raw.hasPrefix("-") ? " " + raw : " -O" + raw
+        }
+        return erase ? " -O" : " -Onone"
+    }()
+    // 有 main.swift 时不能传 -parse-as-library（顶层语句会报错）
+    let hasMainSwift = SwiftFiles.contains { ($0 as NSString).lastPathComponent == "main.swift" }
+    let parseAsLibrary = hasMainSwift ? "" : " -parse-as-library"
+
+    // 桥接头：工程设置优先，其次工程根目录的 bridge.h
+    var bridgingHeader = ""
+    let configuredBridge = resolveProjectFilePath(xcodeConfig.swiftObjcBridgingHeader,
+                                                  projectPath: ProjectInfo.ProjectPath)
+    if !configuredBridge.isEmpty, FileManager.default.fileExists(atPath: configuredBridge) {
+        bridgingHeader = configuredBridge
+    } else if FileManager.default.fileExists(atPath: info[5]) {
+        bridgingHeader = info[5]
+    }
+    let bridgingHeaderFlag = bridgingHeader.isEmpty ? "" : " -import-objc-header " + shellQuote(bridgingHeader)
+
+    // Swift 模块名必须合法；Xcode 的 PRODUCT_MODULE_NAME 默认就是清洗过的 PRODUCT_NAME。
+    // 不传时 swiftc 会用输出文件名推断，带空格/连字符的名字可能直接报错。
+    let swiftModuleName = safeModuleName(finalExecutable)
+    let swiftBaseFlags = swiftMacroFlag + swiftHeaderFlags + swiftImporterDefineFlags
+        + " -sdk " + shellQuote(info[3])
+        + " -target " + targetTriple
+        + " -module-name " + shellQuote(swiftModuleName)
+        + swiftOptimization + " -g"
+
     // 失败文件名写入该文件，避免在 Swift 字符串里拼接 shell 变量（$ 会被当成插值）
     let FAIL_LOG = quoted(ProjectInfo.ProjectPath, "fcm-failed-files.txt")
     let LINK_FLAG = quoted(ProjectInfo.ProjectPath, "fcm-link-failed.txt")
+    let errorDir = "\(ProjectInfo.ProjectPath)/.fcm-errors"
+    // 从每个 .o 对应的日志里提炼 error 行（忽略 warning，避免淹没）
+    let errorSummary = "echo ''; echo '—— 错误摘要 ——'; "
+        + "for f in .fcm-errors/*.txt; do "
+        + "[ -f \"$f\" ] || continue ; "
+        + "E=$(grep -m3 'error:' \"$f\" 2>/dev/null) ; "
+        + "if [ -n \"$E\" ]; then echo \"$(basename \"$f\" .txt):\"; echo \"$E\"; fi ; "
+        + "done ; "
+
+    #if trollstore
+    // TrollStore 分支不使用 Swift 编译参数；显式引用避免 -warnings-as-errors 报未使用变量。
+    _ = (swiftBaseFlags, bridgingHeaderFlag, parseAsLibrary, swiftHeaderFlags, swiftFrameworkLinkFlags)
+    _ = (FAIL_LOG, LINK_FLAG, errorDir, errorSummary)
+    #endif
+
     var EXEC = ""
+    var incrementalToken: String? = nil
+
     if !SwiftFiles.isEmpty {
         #if jailbreak
-        if !MFiles.isEmpty {
-            // shell() 用 bash -e 执行，任何一条 clang 返回非 0 都会让脚本立刻退出。
-            // 所以每条命令都用 || 记录失败文件名，全部跑完再统一判定。
-            EXEC += "rm -f " + FAIL_LOG + " ; "
-            EXEC += MFiles.map { mFile in
-                [
-                "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build_sub) -target arm64-apple-ios\(ProjectInfo.TG) -c ",
-                quoted(ProjectInfo.ProjectPath, mFile),
-                " ", AFiles.joined(separator: " "),
-                " -o '", info[4], "/", UUID().uuidString, ".o' || ",
-                "echo ", Q, mFile, Q, " >> " + FAIL_LOG
-                ].joined()
-            }.joined()
+        // Swift 工程：ObjC 部分先各自编译成 .o，再连同 Swift 一起交给 swiftc 链接。
+        // 每次构建都清空 clang 目录，避免上一轮遗留的 .o 参与链接。
+        var objcObjectPaths: [String] = []
+        EXEC += "rm -rf " + shellQuote(info[4]) + " ; mkdir -p " + shellQuote(info[4])
+            + " " + shellQuote(errorDir) + " ; rm -f " + FAIL_LOG + " ; "
+        for mFile in MFiles {
+            let object = "\(info[4])/\(stableObjectName(mFile)).o"
+            objcObjectPaths.append(object)
+            let errLog = "\(errorDir)/\(stableObjectName(mFile)).o.txt"
+            EXEC += clangCommand + " " + compileFlags(for: mFile) + " " + apiextension.build_sub
+                + " -target " + targetTriple + " -c " + quoted(ProjectInfo.ProjectPath, mFile)
+                + " -o " + shellQuote(object)
+                + " > " + shellQuote(errLog) + " 2>&1 || echo " + shellQuote(mFile)
+                + " >> " + FAIL_LOG + " ; "
         }
-        EXEC += """
-        swiftc -D\(ProjectInfo.Macro) \(quotedList(ProjectInfo.ProjectPath, SwiftFiles)) \(quotedList(ProjectInfo.ProjectPath, AFiles)) \(MFiles.isEmpty ? "" : "clang/*.o") \(apiextension.build) \
-        \(FileManager.default.fileExists(atPath: info[5]) ? "-import-objc-header '\(info[5])'" : "") -parse-as-library -target arm64-apple-ios\(ProjectInfo.TG) -o '\(info[1])/\(ProjectInfo.Executable)'
-        """
-        EXEC += " || true ; "
-        EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '以下文件编译失败：'; cat " + FAIL_LOG + "; exit 1; fi"
+        EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '以下文件编译失败：'; cat " + FAIL_LOG
+            + "; " + errorSummary + "exit 1; fi ; "
+
+        let objectArgs = objcObjectPaths.map { shellQuote($0) }.joined(separator: " ")
+        EXEC += "swiftc " + swiftBaseFlags
+            + " " + quotedList(ProjectInfo.ProjectPath, SwiftFiles)
+            + " " + quotedList(ProjectInfo.ProjectPath, AFiles)
+            + " " + objectArgs
+            + " " + apiextension.build
+            + swiftFrameworkLinkFlags
+            + cxxRuntimeFlag
+            + " " + bridgingHeaderFlag
+            + parseAsLibrary
+            + " -o " + shellQuote(builtBinary)
+            + " || { echo 'Swift 编译或链接失败'; exit 1; } ; "
         #elseif trollstore
         print("TrollStore 版本目前不支持 Swift 工程！\n")
         return 1
@@ -349,12 +499,17 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         // 纯 ObjC 工程：增量 + 并行编译。
         // 只为「源码或编译参数变化」的文件生成编译单元，
         // 其余直接复用已有 .o，二次构建可以快一个数量级。
-        let objectDir = "\(ProjectInfo.ProjectPath)/clang"
+        let objectDir = info[4]
         let token = flagsToken(macro: ProjectInfo.Macro,
                                sdk: ProjectInfo.SDK,
-                               target: ProjectInfo.TG,
+                               target: targetTriple,
                                headerFlags: headerFlags,
-                               extraFlags: objcFlags)
+                               extraFlags: compileFlags(for: "")
+                                    + "|cpp:" + clangLanguageStandardFlags(from: xcodeConfig, forCpp: true)
+                                    + "|" + (usesARC ? "arc" : "noarc")
+                                    + "|headers:" + projectHeadersFingerprint(projectPath: ProjectInfo.ProjectPath,
+                                                                              ignorePrefixes: ignoreList))
+        incrementalToken = token
         let plan = planCompilation(projectPath: ProjectInfo.ProjectPath,
                                    sources: MFiles,
                                    objectDir: objectDir,
@@ -368,21 +523,22 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
 
         let pending = plan.units.filter { $0.needsRebuild }
         if !pending.isEmpty {
-            let errorDir = "\(ProjectInfo.ProjectPath)/.fcm-errors"
             let compileUnits = pending.map { unit in
                 // 错误日志按 .o 名区分；失败时把源文件写进汇总清单，
                 // 具体 error 行由脚本末尾从各自的日志里提取。
                 let errName = (unit.object as NSString).lastPathComponent + ".txt"
-                return [
-                    "clang-14 -D\(ProjectInfo.Macro) \(objcFlags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) -c ",
-                    quoted(ProjectInfo.ProjectPath, unit.source),
-                    " -o ", quoted(ProjectInfo.ProjectPath, "./clang/" + (unit.object as NSString).lastPathComponent),
-                    " > ", quoted(ProjectInfo.ProjectPath, "./.fcm-errors/" + errName),
-                    " 2>&1 || echo ", Q, unit.source, Q
-                    ].joined()
+                return "rm -f " + shellQuote(unit.object)
+                    + " ; " + clangCommand + " " + compileFlags(for: unit.source) + " " + apiextension.build_sub
+                    + " -target " + targetTriple
+                    + " -c " + quoted(ProjectInfo.ProjectPath, unit.source)
+                    + " -o " + shellQuote(unit.object)
+                    + " > " + quoted(ProjectInfo.ProjectPath, "./.fcm-errors/" + errName)
+                    + " 2>&1 || echo " + shellQuote(unit.source)
             }
             let unitsFile = "\(ProjectInfo.ProjectPath)/.fcm-units.txt"
-            cfile(atPath: unitsFile, withContent: compileUnits.joined(separator: "\n"))
+            // NUL 分隔：xargs 默认会解释输入里的引号/反斜杠，
+            // 命令里的单引号路径（含空格的文件名）会被它吃掉。
+            cfile(atPath: unitsFile, withContent: compileUnits.joined(separator: "\u{0}"))
 
             // 调度策略：按可用内存而非只看 CPU 核数，避免 200+ 编译单元并行时被 jetsam
             let scheduler = CompileScheduler.make(projectPath: ProjectInfo.ProjectPath,
@@ -391,49 +547,58 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
 
             let runnerFile = "\(ProjectInfo.ProjectPath)/.fcm-run.sh"
             cfile(atPath: runnerFile, withContent:
-                "#!/bin/sh\nrm -rf '" + errorDir + "' ; mkdir -p '" + errorDir + "'\n"
-                + "cat '" + unitsFile + "' | xargs -P " + String(scheduler.parallelism) + " -I {} sh -c '{}'\n")
+                "#!/bin/sh\nrm -rf " + shellQuote(errorDir) + " ; mkdir -p " + shellQuote(errorDir) + "\n"
+                + "xargs -0 -P " + String(scheduler.parallelism)
+                + " -I {} sh -c '{}' < " + shellQuote(unitsFile) + "\n")
 
-            EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -f " + FAIL_LOG + " ; "
-            EXEC += "sh '" + runnerFile + "' > " + FAIL_LOG + " 2>&1 ; "
-            EXEC += "rm -f '" + runnerFile + "' '" + unitsFile + "' ; "
+            EXEC += "cd " + shellQuote(ProjectInfo.ProjectPath) + " ; rm -f " + FAIL_LOG + " ; "
+            EXEC += "sh " + shellQuote(runnerFile) + " > " + FAIL_LOG + " 2>&1 ; "
+            EXEC += "rm -f " + shellQuote(runnerFile) + " " + shellQuote(unitsFile) + " ; "
         } else {
-            EXEC += "cd '\(ProjectInfo.ProjectPath)' ; rm -f " + FAIL_LOG + " ; "
+            EXEC += "cd " + shellQuote(ProjectInfo.ProjectPath) + " ; rm -f " + FAIL_LOG + " ; "
         }
 
-        // 链接：收集所有 .o（含复用的）
-        EXEC += "mkdir -p '" + info[1] + "' ; "
-        EXEC += """
-        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, AFiles)) clang/*.o -o '\(info[1])/\(ProjectInfo.Executable)' || echo "LINK_FAILED" > '" + LINK_FLAG + "'
-        """
-        EXEC += " ; "
-        // 编译失败与链接失败分开报告，避免把链接错误说成"这些文件编译失败"
-        // 先列出失败文件，再从各自的日志里提炼 error 行（忽略 warning，避免淹没）
-        EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '以下文件编译失败：'; cat " + FAIL_LOG + "; "
-        EXEC += "echo ''; echo '—— 错误摘要 ——'; "
-        EXEC += "cat " + FAIL_LOG + " | sed 's|^|./|' > /dev/null ; "
-        EXEC += "for f in .fcm-errors/*.txt; do "
-        EXEC += "[ -f \"$f\" ] || continue ; "
-        EXEC += "E=$(grep -m3 'error:' \"$f\" 2>/dev/null) ; "
-        EXEC += "if [ -n \"$E\" ]; then echo \"$(basename $f .txt):\"; echo \"$E\"; fi ; "
-        EXEC += "done ; fi ; "
-        EXEC += "if [ -f '" + LINK_FLAG + "' ]; then echo '链接失败，请查看上面的 ld 输出'; rm -f '" + LINK_FLAG + "' ; exit 1 ; fi ; "
-        EXEC += "if [ -s " + FAIL_LOG + " ]; then exit 1 ; fi"
+        // 编译失败与链接失败分开报告，避免把链接错误说成“这些文件编译失败”
+        EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '以下文件编译失败：'; cat " + FAIL_LOG
+            + "; " + errorSummary + "exit 1; fi ; "
+
+        // 链接：只链接本次计划里的 .o（含复用的），不再用 clang/*.o 全局通配，
+        // 否则旧的 UUID .o 会一起被链进来，直接 duplicate symbol。
+        let objectArgs = plan.units.map { shellQuote($0.object) }.joined(separator: " ")
+        let linkFlags = macroFlag + sdkPathFlag + " -fobjc-link-runtime "
+            + apiextension.build + frameflags + cxxRuntimeFlag
+        EXEC += clangCommand + " " + linkFlags + " -target " + targetTriple
+            + " " + objectArgs
+            + " " + quotedList(ProjectInfo.ProjectPath, AFiles)
+            + " -o " + shellQuote(builtBinary)
+            + " || echo LINK_FAILED > " + LINK_FLAG + " ; "
+        EXEC += "if [ -f " + LINK_FLAG + " ]; then echo '链接失败，请查看上面的 ld 输出'; rm -f "
+            + LINK_FLAG + " ; exit 1 ; fi ; "
         #elseif trollstore
-        EXEC += """
-        clang-14 -D\(ProjectInfo.Macro) \(objcFlags) \(frameflags) -fmodules \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(quotedList(ProjectInfo.ProjectPath, MFiles)) \(quotedList(ProjectInfo.ProjectPath, AFiles)) \
-        -o '\(info[1])/\(ProjectInfo.Executable)'
-        """
+        // TrollStore 版本没有并行编译调度，直接把所有源文件交给 clang。
+        // 复用同一套公共参数，避免 C 与 C++ 语言标准互相冲突。
+        EXEC += clangCommand + " " + compileFlags(for: "") + arcFlag + cxxRuntimeFlag
+            + " " + apiextension.build + frameflags
+            + " -target " + targetTriple + " "
+            + quotedList(ProjectInfo.ProjectPath, MFiles)
+            + " " + quotedList(ProjectInfo.ProjectPath, AFiles)
+            + " -o " + shellQuote(builtBinary)
         #endif
     }
 
-    let (CDEXEC) = ("cd '\(ProjectInfo.ProjectPath)'")
+    let CDEXEC = "cd " + shellQuote(ProjectInfo.ProjectPath)
 
     //compiling app
     if !frameworks.isEmpty {
         _ = climessenger("framework-finder","\(frameworks.map { "\($0)" }.joined(separator: "\n"))")
     }
 
+    // 每次构建都重新生成 Payload：否则旧的 .app / 旧二进制会和新产物混在一起。
+    // 注意只清理 Payload 与旧 ipa，clang 目录保留给增量编译复用。
+    let staleIPA = "\(ProjectInfo.ProjectPath)/"
+        + ProjectInfo.Executable.replacingOccurrences(of: " ", with: "_") + ".ipa"
+    _ = rm(staleIPA)
+    _ = rm(info[0])
     cfolder(atPath: info[0])
     cfolder(atPath: info[1])
     cfolder(atPath: info[4])
@@ -476,7 +641,9 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         _ = climessenger("preflight", String(line))
     }
     if diagnostics.hasBlockingIssue {
-        _ = climessenger("preflight", "存在 \(diagnostics.errorCount) 个阻断性问题，构建可能失败")
+        _ = climessenger("preflight", "存在 \(diagnostics.errorCount) 个阻断性问题，已中止构建")
+        _ = rm(info[0])
+        return 1
     }
 
     // ---------------- 编译 ----------------
@@ -484,17 +651,18 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
 
     // 把编译脚本写入文件再执行：Air2 有 200+ 源文件，
     // 拼成 bash -c 的单个参数会超出 posix_spawn 上限（Failed to spawn process）。
-    let buildScript = "\(global_container)/tmp/fcm-build.sh"
+    let buildScript = "\(global_container)/tmp/fcm-build-\(UUID()).sh"
+    cfolder(atPath: "\(global_container)/tmp")
     _ = rm(buildScript)
     cfile(atPath: buildScript, withContent: "#!/bin/bash\nset +e\n" + CDEXEC + "\n" + EXEC)
-    shell("chmod +x '" + buildScript + "'", uid: 501, env: [])
+    shell("chmod +x " + shellQuote(buildScript), uid: 501, env: [])
 
     // bashenv 提供 SDKROOT / CPATH / LIBRARY_PATH，缺了会找不到系统头文件和库
     var compileEnv: [String] = []
     #if !stock
     compileEnv = bashenv
     #endif
-    let compileResult = runCaptured("'" + buildScript + "'", uid: 501, env: compileEnv)
+    let compileResult = runCaptured(shellQuote(buildScript), uid: 501, env: compileEnv)
     _ = rm(buildScript)
 
     if !compileResult.succeeded {
@@ -503,45 +671,39 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
             _ = climessenger("compiler-output", compileResult.output)
         }
         _ = rm(info[0])
-        _ = rm(info[4])
         return 1
     }
     _ = climessenger("compiler-stage", "编译完成")
 
+    // 编译成功后才写增量状态；失败时保留旧状态，下次会重新编译受影响文件。
+    if let token = incrementalToken {
+        saveBuildState(projectPath: ProjectInfo.ProjectPath, sources: MFiles, flagsToken: token)
+    }
+
+
     // ---------------- 打包 .app ----------------
     messenger(status, progress, BuildStage.bundle.display, 0.45)
 
-    // 可执行文件名遵循 Xcode 规则：
-    //   EXECUTABLE_NAME = PRODUCT_NAME（去掉 $(...) 变量）
-    //   实际文件 = EXECUTABLE_PREFIX + EXECUTABLE_NAME + EXECUTABLE_SUFFIX
-    var executableName = ProjectInfo.Executable
-    if !xcodeConfig.productName.isEmpty {
-        let resolved = xcodeConfig.productName
-            .replacingOccurrences(of: "$(TARGET_NAME)", with: ProjectInfo.Executable)
-            .replacingOccurrences(of: "$(PRODUCT_NAME)", with: ProjectInfo.Executable)
-            .replacingOccurrences(of: "${TARGET_NAME}", with: ProjectInfo.Executable)
-            .trimmingCharacters(in: .whitespaces)
-        if !resolved.isEmpty && !resolved.contains("$(") {
-            executableName = resolved
-        }
-    }
-    let finalExecutable = xcodeConfig.executablePrefix + executableName + xcodeConfig.executableSuffix
-    if finalExecutable != ProjectInfo.Executable {
-        _ = climessenger("build-plan", "可执行文件名：\(finalExecutable)（依据 PRODUCT_NAME）")
-    }
-
     let stagingApp = info[1]
-    _ = rm(stagingApp)
-    cfolder(atPath: stagingApp)
 
     // 资源编译：storyboard/xib 交给 ibtool，xcassets 交给 actool，
     // 同时补齐 Info.plist 必需键并生成 PkgInfo，尽量贴近 Xcode 的产出结构。
+    // 链接产物已经写在 stagingApp 内，这里不能再次删除它。
+    let configuredInfoPlist = resolveProjectFilePath(xcodeConfig.infoplistFile,
+                                                     projectPath: ProjectInfo.ProjectPath)
     let resourceReport = compileResources(from: info[2],
                                           into: stagingApp,
                                           projectName: ProjectInfo.Executable,
-                                          executable: ProjectInfo.Executable,
+                                          executable: finalExecutable,
                                           sdkPath: info[3],
-                                          minimumOS: ProjectInfo.TG)
+                                          minimumOS: ProjectInfo.TG,
+                                          infoPlistSource: configuredInfoPlist,
+                                          appIconName: xcodeConfig.assetCatalogAppIcon)
+
+    // 保证 bundle id 与工程记录一致（Info.plist 缺失时 fillInfoPlist 不一定有该键）
+    _ = wplist(value: ProjectInfo.BundleID,
+               forKey: "CFBundleIdentifier",
+               plistPath: "\(stagingApp)/Info.plist")
 
     var bundleSummary = "资源：拷贝 \(resourceReport.copied) 项"
     if resourceReport.storyboards > 0 { bundleSummary += "，界面 \(resourceReport.storyboards) 个" }
@@ -551,8 +713,31 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         _ = climessenger("bundle-stage", "  提示：" + warning)
     }
 
-    // 复制可执行文件（签名前需要它已在 .app 内）
-    let builtBinary = "\(info[1])/\(ProjectInfo.Executable)"
+    // 动态 framework 必须复制进 .app/Frameworks（Xcode 的 Embed Frameworks 阶段），
+    // 只链接不嵌入的话，启动时 dyld 会报 image not found。
+    var embeddedFrameworkBinaries: [String] = []
+    let dynamicFrameworks = localFrameworks.filter {
+        if let type = machoFileType($0.path) { return type == 6 || type == 8 }
+        return false
+    }
+    if !dynamicFrameworks.isEmpty {
+        let frameworksDir = "\(stagingApp)/Frameworks"
+        cfolder(atPath: frameworksDir)
+        for item in dynamicFrameworks {
+            let frameworkDir = (item.path as NSString).deletingLastPathComponent
+            let frameworkName = (frameworkDir as NSString).lastPathComponent
+            let destination = "\(frameworksDir)/\(frameworkName)"
+            _ = rm(destination)
+            if cp(frameworkDir, destination) == 0 {
+                embeddedFrameworkBinaries.append("\(destination)/\(item.name)")
+            } else {
+                _ = climessenger("bundle-stage", "  提示：嵌入 framework 失败：\(frameworkName)")
+            }
+        }
+        _ = climessenger("bundle-stage", "已嵌入动态 framework \(embeddedFrameworkBinaries.count) 个")
+    }
+
+    // 可执行文件必须在 .app 内，签名/打包都以它为入口
     if !FileManager.default.fileExists(atPath: builtBinary) {
         _ = climessenger("bundle-stage", "可执行文件缺失：\(builtBinary)")
         _ = climessenger("bundle-hint", "链接阶段没有产出，请查看上面的编译日志")
@@ -568,56 +753,80 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     if !shellPhases.isEmpty {
         messenger(status, progress, "执行构建脚本", 0.5)
         _ = climessenger("shell-phase", "检测到 \(shellPhases.count) 个脚本阶段")
-        _ = runShellBuildPhases(shellPhases,
-                                projectPath: ProjectInfo.ProjectPath,
-                                appPath: stagingApp,
-                                configuration: erase ? "Release" : "Debug") { line in
+        let phasesSucceeded = runShellBuildPhases(shellPhases,
+                                                  projectPath: ProjectInfo.ProjectPath,
+                                                  appPath: stagingApp,
+                                                  configuration: erase ? "Release" : "Debug",
+                                                  sdkPath: info[3]) { line in
             _ = climessenger("shell-phase", line)
+        }
+        if !phasesSucceeded {
+            // Java 相关阶段的失败在 runner 内部已经降级；走到这里说明是真正的构建错误。
+            _ = climessenger("shell-phase", "脚本阶段失败，已中止构建")
+            _ = rm(info[0])
+            return 1
         }
     }
 
-    // ---------------- 签名 ----------------
-    messenger(status, progress, BuildStage.sign.display, 0.55)
-
-    let toolchain = detectToolchain()
     if toolchain.ldidPath == nil {
         _ = climessenger("sign-stage", "找不到 ldid，无法签名。安装：apt install ldid")
         _ = rm(info[0])
         return 1
     }
 
-    let executablePath = "\(stagingApp)/\(ProjectInfo.Executable)"
-    let signResult = signBinary(executablePath, entitlements: info[6], ldid: toolchain.ldidPath!)
+    let executablePath = "\(stagingApp)/\(finalExecutable)"
+
+    // ---------------- 剥离符号 ----------------
+    // Xcode 的顺序是 strip → 签名。先签名再 strip 会把签名破坏掉，
+    // 表现就是“装上了但启动闪退”。
+    // STRIP_STYLE：all / non-global → -x，debugging → -S
+    if xcodeConfig.stripInstalledProduct {
+        let stripStyle = xcodeConfig.stripStyle.isEmpty ? "all" : xcodeConfig.stripStyle
+        let stripFlag = stripStyle == "debugging" ? "-S" : "-x"
+        // iOS 上不一定有 strip 命令，没有就跳过（不影响产物可用性）
+        let stripPath = ["\(jbroot)/usr/bin/strip", "/usr/bin/strip"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+        if let stripPath = stripPath {
+            let stripResult = runCaptured(shellQuote(stripPath) + " " + stripFlag + " "
+                                          + shellQuote(executablePath) + " 2>&1", uid: 501)
+            if stripResult.succeeded {
+                _ = climessenger("strip-stage", "已剥离符号（\(stripStyle)），大小：\(readableSize(executablePath))")
+            } else {
+                _ = climessenger("strip-stage", "剥离失败（不影响运行）：\(stripResult.output)")
+            }
+        } else {
+            _ = climessenger("strip-stage", "设备上没有 strip 命令，已跳过")
+        }
+    }
+
+    // ---------------- 签名 ----------------
+    messenger(status, progress, BuildStage.sign.display, 0.55)
+
+    // CODE_SIGN_ENTITLEMENTS 优先于工程根目录的 entitlements.plist
+    var entitlementsPath = info[6]
+    let configuredEntitlements = resolveProjectFilePath(xcodeConfig.codeSignEntitlements,
+                                                        projectPath: ProjectInfo.ProjectPath)
+    if !configuredEntitlements.isEmpty,
+       FileManager.default.fileExists(atPath: configuredEntitlements) {
+        entitlementsPath = configuredEntitlements
+    }
+
+    let signResult = signBinary(executablePath, entitlements: entitlementsPath, ldid: toolchain.ldidPath!)
     if !signResult.0 {
         _ = climessenger("sign-stage", "签名失败：\(signResult.1)")
         _ = climessenger("sign-hint", "请检查 entitlements.plist 是否与本机越狱环境匹配")
         _ = rm(info[0])
         return 1
     }
-    _ = climessenger("sign-stage", "签名完成：\(ProjectInfo.Executable)")
+    _ = climessenger("sign-stage", "签名完成：\(finalExecutable)")
 
-    // ---------------- 剥离符号 ----------------
-    // Xcode: STRIP_INSTALLED_PRODUCT=YES 时对产物执行 strip
-    // STRIP_STYLE 决定剥离哪些符号：all / non-global / debugging
-    if xcodeConfig.stripInstalledProduct {
-        let stripStyle = xcodeConfig.stripStyle.isEmpty ? "all" : xcodeConfig.stripStyle
-        var stripFlag = "-x"
-        switch stripStyle {
-        case "all": stripFlag = "-x"
-        case "non-global": stripFlag = "-x"
-        case "debugging": stripFlag = "-S"
-        default: stripFlag = "-x"
-        }
-        // iOS 上不一定有 strip 命令，没有就跳过（不影响产物可用性）
-        let hasStrip = ["/var/jb/usr/bin/strip", "/usr/bin/strip"]
-            .contains { FileManager.default.isExecutableFile(atPath: $0) }
-        let stripResult = hasStrip
-            ? runCaptured("strip \(stripFlag) '\(executablePath)' 2>&1", uid: 501)
-            : CommandResult(code: -1, output: "设备上没有 strip 命令，已跳过")
-        if stripResult.succeeded {
-            _ = climessenger("strip-stage", "已剥离符号（\(stripStyle)），大小：\(readableSize(executablePath))")
+    // 嵌入的 framework 也要 ad-hoc 签名，否则同样会在加载时被系统拒绝
+    for binary in embeddedFrameworkBinaries {
+        let nested = signBinary(binary, entitlements: nil, ldid: toolchain.ldidPath!)
+        if nested.0 {
+            _ = climessenger("sign-stage", "已签名嵌入库：\((binary as NSString).lastPathComponent)")
         } else {
-            _ = climessenger("strip-stage", "剥离失败（不影响运行）：\(stripResult.output)")
+            _ = climessenger("sign-stage", "嵌入库签名失败：\(nested.1)")
         }
     }
 
@@ -645,7 +854,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         _ = climessenger("verify-stage", "提示：工程有脚本阶段，但产物里没有发现 jar")
     }
 
-    let macho = verifyMachO(executablePath)
+    let macho = verifyMachO(executablePath, expectedArch: targetArch)
     if !macho.0 {
         _ = climessenger("verify-stage", "可执行文件校验失败：\(macho.1)")
         _ = rm(info[0])
@@ -674,7 +883,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
 
         #if !stock
         if erase {
-            killTaskWithProcessName(ProjectInfo.Executable)
+            killTaskWithProcessName(finalExecutable)
             let installPath = "\(ProjectInfo.ProjectPath)/ts.ipa"
             _ = rm(installPath)
             if cp(ipaPath, installPath) != 0 {
@@ -682,12 +891,13 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
                 _ = rm(info[0])
                 return 1
             }
-            let result = shell("\(Bundle.main.bundlePath)/tshelper install '\(installPath)' > /dev/null 2>&1", uid: 0)
+            let result = shell(shellQuote("\(Bundle.main.bundlePath)/tshelper")
+                               + " install " + shellQuote(installPath) + " > /dev/null 2>&1", uid: 0)
             _ = climessenger("install-stage", "TrollStore Helper 返回 \(result)")
             _ = rm(installPath)
 
+            // 只清理 Payload，clang 目录留给下一次增量编译
             _ = rm(info[0])
-            _ = rm(info[4])
             if result != 0 {
                 _ = climessenger("install-hint", "安装未成功。可把生成的 ipa 传到设备，用 TrollStore / 自签工具安装。")
                 return result
@@ -696,17 +906,39 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         }
         #endif
 
+        // 导出场景：只生成产物，不安装
         _ = rm(info[0])
-        _ = rm(info[4])
         return 0
     } else {
         // 命令行工具：直接运行看返回值
-        let result = shell("\"\(executablePath)\"")
+        let result = shell(shellQuote(executablePath))
         _ = climessenger("run-stage", "退出码 \(result)")
         _ = rm(info[0])
-        _ = rm(info[4])
         return 0
     }
+}
+
+/// 解析 PRODUCT_NAME / EXECUTABLE_NAME。
+/// 只有明确、完全展开的名字才采用；否则回退到 FCM 记录的可执行名。
+private func resolveExecutableName(_ fallback: String, config: XcodeBuildConfig) -> String {
+    var name = config.productName
+        .replacingOccurrences(of: "$(TARGET_NAME)", with: fallback)
+        .replacingOccurrences(of: "${TARGET_NAME}", with: fallback)
+        .replacingOccurrences(of: "$(PRODUCT_NAME)", with: fallback)
+        .replacingOccurrences(of: "${PRODUCT_NAME}", with: fallback)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    if name.isEmpty || name.contains("$(") || name.contains("${") || name.contains("/") {
+        name = fallback
+    }
+    return name
+}
+
+/// 把 pbxproj 里的路径（可能是相对路径）解析成工程内绝对路径
+private func resolveProjectFilePath(_ raw: String, projectPath: String) -> String {
+    let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !value.isEmpty else { return "" }
+    if value.hasPrefix("/") { return value }
+    return (projectPath as NSString).appendingPathComponent(value)
 }
 
 private func messenger(_ status: Binding<String>?,_ progress: Binding<Double>?,_ tstat: String,_  tproc: Double) -> Void {

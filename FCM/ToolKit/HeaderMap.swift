@@ -68,18 +68,11 @@ func buildHeaderMap(projectPath: String, ignorePrefixes: [String] = []) -> Heade
         return result
     }
 
-    let ignoreSet = Set(ignorePrefixes.filter { !$0.isEmpty })
     // 排除构建产物与版本控制目录
-    let skipDirs: Set<String> = [".git", "build", "Payload", "clang", ".fcm-cache",
-                                 ".fcm-errors", "node_modules", "DerivedData",
-                                 ".xcodeproj", "Pods"]
+    let ignoredPrefixes = makeBuildIgnoreList("") + ignorePrefixes + [".xcodeproj"]
 
     for file in all where file.hasSuffix(".h") || file.hasSuffix(".hh") || file.hasSuffix(".hpp") {
-        // 用户配置的忽略项
-        if ignoreSet.contains(where: { file.hasPrefix($0) }) { continue }
-
-        let parts = file.split(separator: "/").map(String.init)
-        if parts.contains(where: { skipDirs.contains($0) }) { continue }
+        if isPathIgnored(file, prefixes: ignoredPrefixes) { continue }
         // 跳过 .xcodeproj 内部
         if file.contains(".xcodeproj/") { continue }
 

@@ -53,6 +53,9 @@ struct XcodeBuildConfig {
     var systemHeaderSearchPaths: [String] = []    // SYSTEM_HEADER_SEARCH_PATHS → -isystem
     var systemFrameworkSearchPaths: [String] = [] // SYSTEM_FRAMEWORK_SEARCH_PATHS
     var cxxLanguageStandard: String = ""          // CLANG_CXX_LANGUAGE_STANDARD
+    var swiftOptimizationLevel: String = ""       // SWIFT_OPTIMIZATION_LEVEL（-Onone / -O）
+    var swiftObjcBridgingHeader: String = ""      // SWIFT_OBJC_BRIDGING_HEADER
+    var swiftVersion: String = ""                 // SWIFT_VERSION
     var productName: String = ""                  // PRODUCT_NAME
     var executablePrefix: String = ""             // EXECUTABLE_PREFIX
     var executableSuffix: String = ""             // EXECUTABLE_SUFFIX
@@ -120,17 +123,31 @@ func loadXcodeBuildConfig(projectPath: String) -> XcodeBuildConfig {
     config.systemHeaderSearchPaths = parseListSetting("SYSTEM_HEADER_SEARCH_PATHS", in: text, projectPath: projectPath)
     config.systemFrameworkSearchPaths = parseListSetting("SYSTEM_FRAMEWORK_SEARCH_PATHS", in: text, projectPath: projectPath)
     config.cxxLanguageStandard = parseStringSetting("CLANG_CXX_LANGUAGE_STANDARD", in: text, projectPath: projectPath)
+    config.swiftOptimizationLevel = parseStringSetting("SWIFT_OPTIMIZATION_LEVEL", in: text, projectPath: projectPath)
+    config.swiftObjcBridgingHeader = parseStringSetting("SWIFT_OBJC_BRIDGING_HEADER", in: text, projectPath: projectPath)
+    config.swiftVersion = parseStringSetting("SWIFT_VERSION", in: text, projectPath: projectPath)
     config.productName = parseStringSetting("PRODUCT_NAME", in: text, projectPath: projectPath)
     config.executablePrefix = parseStringSetting("EXECUTABLE_PREFIX", in: text, projectPath: projectPath)
     config.executableSuffix = parseStringSetting("EXECUTABLE_SUFFIX", in: text, projectPath: projectPath)
-    config.architectures = parseStringSetting("ARCHS", in: text, projectPath: projectPath)
-    config.validArchs = parseStringSetting("VALID_ARCHS", in: text, projectPath: projectPath)
+    // ARCHS 既可能是单值，也可能写成数组 (arm64, arm64e)；
+    // 数组形式用 parseStringSetting 会被括号/换行截断，必须按列表解析。
+    let archValues = parseListSetting("ARCHS", in: text, projectPath: projectPath)
+    config.architectures = archValues.isEmpty
+        ? parseStringSetting("ARCHS", in: text, projectPath: projectPath)
+        : archValues.joined(separator: " ")
+    let validArchValues = parseListSetting("VALID_ARCHS", in: text, projectPath: projectPath)
+    config.validArchs = validArchValues.isEmpty
+        ? parseStringSetting("VALID_ARCHS", in: text, projectPath: projectPath)
+        : validArchValues.joined(separator: " ")
     config.onlyActiveArch = parseBoolSetting("ONLY_ACTIVE_ARCH", in: text, defaultValue: false)
     config.stripInstalledProduct = parseBoolSetting("STRIP_INSTALLED_PRODUCT", in: text, defaultValue: false)
     config.stripStyle = parseStringSetting("STRIP_STYLE", in: text, projectPath: projectPath)
     config.debugInformationFormat = parseStringSetting("DEBUG_INFORMATION_FORMAT", in: text, projectPath: projectPath)
     config.codeSignEntitlements = parseStringSetting("CODE_SIGN_ENTITLEMENTS", in: text, projectPath: projectPath)
-    config.excludedArchitectures = parseStringSetting("EXCLUDED_ARCHITECTURES", in: text, projectPath: projectPath)
+    let excludedValues = parseListSetting("EXCLUDED_ARCHITECTURES", in: text, projectPath: projectPath)
+    config.excludedArchitectures = excludedValues.isEmpty
+        ? parseStringSetting("EXCLUDED_ARCHITECTURES", in: text, projectPath: projectPath)
+        : excludedValues.joined(separator: " ")
     config.assetCatalogAppIcon = parseStringSetting("ASSETCATALOG_COMPILER_APPICON_NAME", in: text, projectPath: projectPath)
     config.assetCatalogAccentColor = parseStringSetting("ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME", in: text, projectPath: projectPath)
     config.marketingVersion = parseStringSetting("MARKETING_VERSION", in: text, projectPath: projectPath)
@@ -153,10 +170,10 @@ private func expandVariables(_ value: String, projectPath: String) -> String {
     // $(inherited) 在单文件层面没有上级，直接去掉
     result = result.replacingOccurrences(of: "$(inherited)", with: "")
     result = result.replacingOccurrences(of: "${inherited}", with: "")
-    // $(TARGET_NAME) / $(PRODUCT_NAME) 在库搜索路径里偶尔出现，用工程名兜底
-    let projectName = (projectPath as NSString).lastPathComponent
-    result = result.replacingOccurrences(of: "$(TARGET_NAME)", with: projectName)
-    result = result.replacingOccurrences(of: "$(PRODUCT_NAME)", with: projectName)
+    // 注意：$(TARGET_NAME) / $(PRODUCT_NAME) 不能在这里用工程目录名展开。
+    // 工程目录是 UUID，展开后 PRODUCT_NAME 会变成 UUID，
+    // 导致最终二进制名与 Info.plist 的 CFBundleExecutable 对不上。
+    // 这些变量留给 build() 在拿到 ProjectInfo 之后再解析。
     return result.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
@@ -310,14 +327,18 @@ private func parseStringSetting(_ key: String, in text: String, projectPath: Str
     let pattern = key + "\\s*=\\s*\"?([^;\"\\n]+)\"?\\s*;"
     guard let regex = try? NSRegularExpression(pattern: pattern) else { return "" }
     let ns = text as NSString
+    var found = ""
+
+    // pbxproj 里同一个 key 会出现在工程级与 target 级配置中。
+    // 后者（target 级）在文件里通常靠后，而且优先级更高，所以取最后一个非空值。
     for match in regex.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
         guard match.numberOfRanges > 1 else { continue }
         let raw = ns.substring(with: match.range(at: 1))
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if raw.isEmpty { continue }
-        return expandVariables(raw, projectPath: projectPath)
+        found = expandVariables(raw, projectPath: projectPath)
     }
-    return ""
+    return found
 }
 
 private func parseBoolSetting(_ key: String, in text: String, defaultValue: Bool) -> Bool {
@@ -377,6 +398,19 @@ func clangIncludeFlags(from config: XcodeBuildConfig) -> String {
     return flags
 }
 
+/// 拆分 Xcode 列表里的单个条目。
+/// OTHER_LDFLAGS / OTHER_CFLAGS 中的条目偶尔会把多个参数写在一个字符串里
+/// （如 "-framework UIKit"），直接整体加引号会变成“一个带空格的参数”，clang 无法识别。
+private func splitFlagTokens(_ raw: String) -> [String] {
+    var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if value.hasPrefix("\"") && value.hasSuffix("\"") && value.count > 2 {
+        value = String(value.dropFirst().dropLast())
+    }
+    return value.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" })
+        .map { String($0).trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+}
+
 /// 把工程配置转成 clang 的链接参数
 func clangLinkFlags(from config: XcodeBuildConfig) -> String {
     var flags = ""
@@ -391,47 +425,117 @@ func clangLinkFlags(from config: XcodeBuildConfig) -> String {
         flags += " -iframework" + shellQuote(path)
     }
     for raw in config.otherLDFlags {
-        // Xcode 里写的是 "-Wl,-U,_sym" 这种形式，去掉外层引号即可直接用
-        var flag = raw.trimmingCharacters(in: .whitespaces)
-        if flag.hasPrefix("\"") && flag.hasSuffix("\"") && flag.count > 2 {
-            flag = String(flag.dropFirst().dropLast())
+        for flag in splitFlagTokens(raw) {
+            guard isValidShellArgument(flag) else { continue }
+            flags += " " + shellQuote(flag)
         }
-        if flag.isEmpty { continue }
-        guard isValidShellArgument(flag) else { continue }
-        flags += " " + shellQuote(flag)
     }
     return flags
 }
 
-/// 把工程配置转成语言标准与优化相关的 clang 参数
-func clangCodegenFlags(from config: XcodeBuildConfig) -> String {
+/// Swift 驱动的链接参数。
+///
+/// swiftc 不像 clang 那样接受任意 `-Wl,...` / `-ObjC`，
+/// 必须把它们转成 `-Xlinker` 逐项传递；否则会直接报 unknown argument。
+func swiftLinkFlags(from config: XcodeBuildConfig) -> String {
     var flags = ""
-
-    // C 语言标准：gnu17 → -std=gnu17
-    if !config.clanguageStandard.isEmpty {
-        let std = config.clanguageStandard.trimmingCharacters(in: .whitespaces)
-        if !std.isEmpty { flags += " -std=" + std }
+    for path in config.librarySearchPaths {
+        flags += " -L" + shellQuote(path)
+    }
+    for path in config.frameworkSearchPaths {
+        flags += " -F" + shellQuote(path)
+    }
+    for path in config.systemFrameworkSearchPaths {
+        guard isValidShellArgument(path) else { continue }
+        flags += " -F" + shellQuote(path)
     }
 
-    // 优化级别：0 / 1 / 2 / 3 / s / fast
-    if !config.optimizationLevel.isEmpty {
-        let level = config.optimizationLevel.trimmingCharacters(in: .whitespaces)
-        if !level.isEmpty { flags += " -O" + level }
+    // 把 OTHER_LDFLAGS 展开成 token，再逐个转换
+    var tokens: [String] = []
+    for raw in config.otherLDFlags {
+        tokens.append(contentsOf: splitFlagTokens(raw))
     }
 
-    // C++ 语言标准：直接 -std=gnu++17
-    // 注意：不能写成 -Xclang -std=xxx，那是给 cc1 传参的错误用法
-    if !config.cxxLanguageStandard.isEmpty {
-        let cxx = config.cxxLanguageStandard.trimmingCharacters(in: .whitespaces)
-        if !cxx.isEmpty { flags += " -std=" + cxx }
+    var index = 0
+    while index < tokens.count {
+        let token = tokens[index]
+        if token.hasPrefix("-Wl,") {
+            // -Wl,-rpath,/path → -Xlinker -rpath -Xlinker /path
+            let parts = token.dropFirst(4).split(separator: ",", omittingEmptySubsequences: false)
+            for part in parts {
+                flags += " -Xlinker " + shellQuote(String(part))
+            }
+            index += 1
+            continue
+        }
+        // -framework / -weak_framework 等需要和后面的名字成对传给 Swift 驱动
+        let pairFlags: Set<String> = ["-framework", "-weak_framework", "-lazy_framework",
+                                      "-reexport_framework", "-needed_framework"]
+        if pairFlags.contains(token), index + 1 < tokens.count {
+            flags += " " + token + " " + shellQuote(tokens[index + 1])
+            index += 2
+            continue
+        }
+        if token.hasPrefix("-l") || token.hasPrefix("-L") ||
+           token.hasPrefix("-F") || token == "-ObjC" {
+            // -ObjC 虽然是 linker 参数，但 Swift 驱动不接受直接形式
+            if token == "-ObjC" {
+                flags += " -Xlinker " + shellQuote(token)
+            } else {
+                flags += " " + shellQuote(token)
+            }
+            index += 1
+            continue
+        }
+        if isValidShellArgument(token) {
+            flags += " -Xlinker " + shellQuote(token)
+        }
+        index += 1
     }
 
-    // 严格 objc msgSend 检查会插入额外检查，设备上关闭可减少运行时开销
-    if config.strictObjCMsgSend {
-        flags += " -fno-strict-objc-msgsend"
+    for path in config.runpathSearchPaths where !path.isEmpty {
+        guard isValidShellArgument(path) else { continue }
+        flags += " -Xlinker -rpath -Xlinker " + shellQuote(path)
     }
-
     return flags
+}
+
+/// OTHER_CFLAGS：直接透传给 clang（同样逐 token 处理）
+func clangOtherCFlags(from config: XcodeBuildConfig) -> String {
+    var flags = ""
+    for raw in config.otherCFlags {
+        for flag in splitFlagTokens(raw) {
+            guard isValidShellArgument(flag) else { continue }
+            flags += " " + shellQuote(flag)
+        }
+    }
+    return flags
+}
+
+/// 优化级别：GCC_OPTIMIZATION_LEVEL 0/1/2/3/s/fast → -O0/-Os...
+func clangOptimizationFlags(from config: XcodeBuildConfig) -> String {
+    let level = config.optimizationLevel.trimmingCharacters(in: .whitespaces)
+    return level.isEmpty ? "" : " -O" + level
+}
+
+/// 语言标准必须按源文件语言区分：
+/// 只编译 C 文件时传 -std=gnu++17 会直接报错，反之亦然。
+func clangLanguageStandardFlags(from config: XcodeBuildConfig, forCpp: Bool) -> String {
+    if forCpp {
+        let cxx = config.cxxLanguageStandard.trimmingCharacters(in: .whitespaces)
+        guard !cxx.isEmpty else { return "" }
+        // Xcode 里可能存成 "gnu++17" / "c++17" / "c++20"
+        return " -std=" + cxx
+    }
+    let c = config.clanguageStandard.trimmingCharacters(in: .whitespaces)
+    guard !c.isEmpty else { return "" }
+    // Xcode 里可能存成 gnu17 / gnu11 / c99
+    return " -std=" + c
+}
+
+/// 严格 objc msgSend 检查会插入额外检查，设备上关闭可减少运行时开销
+func clangObjCMessagingFlags(from config: XcodeBuildConfig) -> String {
+    return config.strictObjCMsgSend ? " -fno-strict-objc-msgsend" : ""
 }
 
 /// 解析目标架构
@@ -455,8 +559,10 @@ func resolveTargetArchitectures(from config: XcodeBuildConfig) -> [String] {
         // $(ARCHS_STANDARD) 对 iOS 设备即 arm64
         let cleaned = source
             .replacingOccurrences(of: "$(ARCHS_STANDARD)", with: "arm64")
+            .replacingOccurrences(of: "${ARCHS_STANDARD}", with: "arm64")
             .replacingOccurrences(of: "$(ARCHS_STANDARD_64_BIT)", with: "arm64")
-            .replacingOccurrences(of: "$(ARCHS_STANDARD_32_64_BIT)", with: "arm64")
+            .replacingOccurrences(of: "$(ARCHS_STANDARD_32_BIT)", with: "armv7")
+            .replacingOccurrences(of: "$(ARCHS_STANDARD_32_64_BIT)", with: "arm64 armv7")
             .replacingOccurrences(of: "$(inherited)", with: "")
         archs = cleaned
             .split(whereSeparator: { $0 == " " || $0 == "," })
@@ -464,9 +570,11 @@ func resolveTargetArchitectures(from config: XcodeBuildConfig) -> [String] {
             .filter { !$0.isEmpty }
     }
 
-    if archs.isEmpty {
-        archs = ["arm64"]
-    }
+    // 设备构建只接受 ARM 架构。
+    // 很多工程把 ARCHS 写成 "arm64 x86_64"（同时支持真机与模拟器），
+    // 把 x86_64 传给 iOS 设备编译器会得到 “building for iOS, but linking ... simulator”。
+    let deviceArchs = archs.filter { ["arm64", "arm64e", "armv7", "armv7s"].contains($0) }
+    archs = deviceArchs.isEmpty ? ["arm64"] : deviceArchs
     // 去掉被排除的
     archs = archs.filter { !excluded.contains($0) }
     return archs.isEmpty ? ["arm64"] : archs

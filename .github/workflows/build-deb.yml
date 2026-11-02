@@ -84,7 +84,9 @@ jobs:
         run: |
           set -eux
           TARGET="Blueprint/FridaCodeManager.app/include"
-          if [ ! -d "$TARGET" ]; then
+          # 子模块 checkout 后目录存在但为空；只看 -d 会跳过 clone，编译必然缺头文件
+          if [ -z "$(ls -A "$TARGET" 2>/dev/null)" ]; then
+            rm -rf "$TARGET" .headers
             git clone --depth 1 https://github.com/theos/headers.git .headers
             mv .headers "$TARGET"
           fi
@@ -138,8 +140,10 @@ jobs:
           dpkg-deb -c "$DEB" | grep -q swifty || { echo "::error::deb 内没有主程序 swifty"; exit 1; }
           rm -rf .unpack && mkdir .unpack
           dpkg-deb -x "$DEB" .unpack
-          file .unpack/*/Applications/FridaCodeManager.app/swifty || \
-            file .unpack/Applications/FridaCodeManager.app/swifty || true
+          BIN=$(find .unpack -type f -name swifty | head -n 1)
+          test -n "$BIN" || { echo "::error::deb 解包后找不到 swifty"; exit 1; }
+          file "$BIN"
+          file "$BIN" | grep -q arm64 || { echo "::error::swifty 不是 arm64"; exit 1; }
 
       - name: 上传产物
         uses: actions/upload-artifact@v4

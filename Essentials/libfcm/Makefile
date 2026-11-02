@@ -6,7 +6,12 @@
 #
 
 # config
+# 越狱设备上 /var/jb/bin/sh 才存在；macOS / 其他环境退回 /bin/sh。
+ifeq ($(wildcard /var/jb/bin/sh),)
+SHELL := /bin/sh
+else
 SHELL := /var/jb/bin/sh
+endif
 SDKROOT := ./sdk
 CC := clang
 CF := -target arm64-apple-ios15 -arch arm64

@@ -50,24 +50,87 @@ func typecheck(_ ProjectInfo: Project) -> Void {
     }
 
     //finding code files
-    let (MFiles, AFiles, SwiftFiles) = (FindFilesStack(ProjectInfo.ProjectPath, [".m", ".c", ".mm", ".cpp"], splitAndTrim(apiextension.ign) + ["Resources"]), FindFilesStack(ProjectInfo.ProjectPath, [".a"], splitAndTrim(apiextension.ign) + ["Resources"]), FindFilesStack(ProjectInfo.ProjectPath, [".swift"], splitAndTrim(apiextension.ign) + ["Resources"]))
+    let ignoreList = makeBuildIgnoreList(apiextension.ign)
+    let MFiles = FindFilesStack(ProjectInfo.ProjectPath, [".m", ".c", ".mm", ".cpp", ".cc", ".cxx", ".s"], ignoreList)
+    let SwiftFiles = FindFilesStack(ProjectInfo.ProjectPath, [".swift"], ignoreList)
+
+    // 头文件搜索路径与构建保持一致：工程配置优先，否则目录扫描 + header map
+    let xcodeConfig = loadXcodeBuildConfig(projectPath: ProjectInfo.ProjectPath)
+    var headerFlags = ""
+    var swiftHeaderFlags = ""
+    if xcodeConfig.sourceFound &&
+        (!xcodeConfig.headerSearchPaths.isEmpty ||
+         !xcodeConfig.userHeaderSearchPaths.isEmpty ||
+         !xcodeConfig.systemHeaderSearchPaths.isEmpty) {
+        headerFlags = clangIncludeFlags(from: xcodeConfig)
+        for path in xcodeConfig.userHeaderSearchPaths where isValidShellArgument(path) {
+            swiftHeaderFlags += " -Xcc -iquote" + shellQuote(path)
+        }
+        for path in xcodeConfig.headerSearchPaths where isValidShellArgument(path) {
+            swiftHeaderFlags += " -Xcc -I" + shellQuote(path)
+        }
+        for path in xcodeConfig.systemHeaderSearchPaths where isValidShellArgument(path) {
+            swiftHeaderFlags += " -Xcc -isystem" + shellQuote(path)
+        }
+    } else {
+        let dirs = discoverHeaderDirectories(ProjectInfo.ProjectPath)
+        headerFlags = dirs.map { " -I" + shellQuote($0) }.joined()
+        swiftHeaderFlags = swiftClangImporterFlags(headerDirectories: dirs)
+    }
+    swiftHeaderFlags += " -Xcc -I" + shellQuote(ProjectInfo.ProjectPath)
+
+    let headerMap = buildHeaderMap(projectPath: ProjectInfo.ProjectPath, ignorePrefixes: ignoreList)
+    if headerMap.count > 0 {
+        headerFlags += " -I" + shellQuote(headerMap.directory)
+        swiftHeaderFlags += " -Xcc -I" + shellQuote(headerMap.directory)
+    }
+
+    let targetArchs = resolveTargetArchitectures(from: xcodeConfig)
+    let targetArch = targetArchs.first(where: { $0 == "arm64" }) ?? targetArchs[0]
+    let targetTriple = "\(targetArch)-apple-ios\(ProjectInfo.TG)"
+    let sdkFlag = " -isysroot " + shellQuote(info[3])
+    let macroFlag = ProjectInfo.Macro.isEmpty ? "" : " -D" + shellQuote(ProjectInfo.Macro)
+    let modulesFlag = xcodeConfig.enableModules ? " -fmodules" : ""
+    let arcFlag = (xcodeConfig.enableObjCARC && !apiextension.noarc)
+        ? " -fobjc-arc" : " -fno-objc-arc"
+    // 语法检查不链接，但仍需要正确的语言标准
+    let cStd = clangLanguageStandardFlags(from: xcodeConfig, forCpp: false)
+    let cxxStd = clangLanguageStandardFlags(from: xcodeConfig, forCpp: true)
+
+    func clangCheckFlags(for source: String) -> String {
+        let ext = (source as NSString).pathExtension.lowercased()
+        var flags = macroFlag + headerFlags + sdkFlag + modulesFlag
+        if ext == "s" { return flags }
+        if ext == "m" || ext == "mm" { flags += arcFlag }
+        let isCpp = ext == "mm" || ext == "cpp" || ext == "cc" || ext == "cxx"
+        return flags + (isCpp ? cxxStd : cStd)
+    }
 
     var EXEC = ""
     if !SwiftFiles.isEmpty {
         if !MFiles.isEmpty {
             EXEC += MFiles.map { mFile in
-                "clang -D\(ProjectInfo.Macro) -fmodules -fsyntax-only \(apiextension.build_sub) -target arm64-apple-ios\(ProjectInfo.TG) -c \(ProjectInfo.ProjectPath)/\(mFile) \(AFiles.joined(separator: " ")) ; "
+                "clang-14 " + clangCheckFlags(for: mFile) + " " + apiextension.build_sub
+                    + " -target " + targetTriple + " -fsyntax-only " + quoted(ProjectInfo.ProjectPath, mFile)
+                    + " ; "
             }.joined()
         }
-        EXEC += """
-        swiftc -typecheck -D\(ProjectInfo.Macro) \(apiextension.build) \(SwiftFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \(AFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \
-        \(FileManager.default.fileExists(atPath: info[5]) ? "-import-objc-header '\(info[5])'" : "") -parse-as-library -target arm64-apple-ios\(ProjectInfo.TG)
-        """
+        let hasMainSwift = SwiftFiles.contains { ($0 as NSString).lastPathComponent == "main.swift" }
+        let parseAsLibrary = hasMainSwift ? "" : " -parse-as-library"
+        let bridge = FileManager.default.fileExists(atPath: info[5])
+            ? " -import-objc-header " + shellQuote(info[5]) : ""
+        EXEC += "swiftc -typecheck " + macroFlag + swiftHeaderFlags + " -sdk " + shellQuote(info[3])
+            + " -target " + targetTriple
+            + " " + quotedList(ProjectInfo.ProjectPath, SwiftFiles)
+            + bridge + parseAsLibrary
     } else {
-        EXEC += "clang -D\(ProjectInfo.Macro) -fmodules -fsyntax-only \(apiextension.build) -target arm64-apple-ios\(ProjectInfo.TG) \(MFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " ")) \(AFiles.map { "\(ProjectInfo.ProjectPath)/\($0)" }.joined(separator: " "))"
+        EXEC += "clang-14 " + clangCheckFlags(for: "")
+            + " " + apiextension.build_sub
+            + " -target " + targetTriple + " -fsyntax-only "
+            + quotedList(ProjectInfo.ProjectPath, MFiles)
     }
 
-    let (CDEXEC) = ("cd '\(ProjectInfo.ProjectPath)'")
+    let (CDEXEC) = ("cd " + shellQuote(ProjectInfo.ProjectPath))
 
     //typechecking
     _ = climessenger("","","\(CDEXEC) ; \(EXEC)", nil, bashenv)

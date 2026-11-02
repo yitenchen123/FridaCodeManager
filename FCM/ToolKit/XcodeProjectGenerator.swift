@@ -61,10 +61,17 @@ struct XcodeProjectSpec {
     var sources: [XcodeSourceFile]
     var resources: [XcodeResourceFile]
     var frameworks: [XcodeFrameworkRef]
+    // 头文件只进 PBXGroup（不参与 Sources 阶段），但必须引用，
+    // 否则 Xcode 里看不到文件，也无法建立 index。
+    var headers: [XcodeSourceFile] = []
     var headerSearchPaths: [String] = []
     var otherLDFlags: [String] = []
     var preprocessorDefinitions: [String] = []
     var infoPlistPath: String = ""
+    var bridgingHeader: String = ""
+    var codeSignEntitlements: String = ""
+    var assetCatalogAppIcon: String = ""
+    var swiftVersion: String = "5.0"
     var enableARC: Bool = true
 }
 
@@ -95,6 +102,9 @@ private func swiftString(_ value: String) -> String {
     let escaped = value
         .replacingOccurrences(of: "\\", with: "\\\\")
         .replacingOccurrences(of: "\"", with: "\\\"")
+        .replacingOccurrences(of: "\n", with: "\\n")
+        .replacingOccurrences(of: "\t", with: "\\t")
+        .replacingOccurrences(of: "\r", with: "\\r")
     return "\"" + escaped + "\""
 }
 
@@ -108,7 +118,9 @@ func xcodeFileType(for path: String) -> String {
     case "c": return "sourcecode.c.c"
     case "cpp", "cc", "cxx": return "sourcecode.cpp.cpp"
     case "swift": return "sourcecode.swift"
-    case "h", "hpp": return "sourcecode.c.h"
+    case "s": return "sourcecode.asm"
+    case "metal": return "sourcecode.metal"
+    case "h", "hpp", "hh", "hxx": return "sourcecode.c.h"
     case "plist": return "text.plist.xml"
     case "xcassets": return "folder.assetcatalog"
     case "storyboard": return "file.storyboard"
@@ -184,19 +196,48 @@ func generatePBXProj(_ spec: XcodeProjectSpec) -> String {
         let fileRef = xcUUID("fileref", resource.relativePath)
         let buildFile = xcUUID("buildfile", resource.relativePath)
         let name = (resource.relativePath as NSString).lastPathComponent
-        let refType = resource.isFolder ? "folder" : "lastKnownFileType = \(resource.fileType)"
+        // folder 也必须写成 lastKnownFileType = folder；只写 "folder" 不是合法 pbxproj。
+        let fileType = resource.isFolder ? "folder" : resource.fileType
         fileRefs.append("""
-                \(fileRef) /* \(name) */ = {isa = PBXFileReference; \(refType); path = \(swiftString(name)); sourceTree = "<group>"; };
+                \(fileRef) /* \(name) */ = {isa = PBXFileReference; lastKnownFileType = \(fileType); path = \(swiftString(name)); sourceTree = "<group>"; };
         """)
         buildFiles.append("""
                 \(buildFile) /* \(name) in Resources */ = {isa = PBXBuildFile; fileRef = \(fileRef) /* \(name) */; };
         """)
         resourceBuildFileUUIDs.append(buildFile)
+
+        // 资源也必须挂进 PBXGroup：只引用不挂组时，Xcode 无法解析相对路径，
+        // 子目录里的资源会报 "Build input file cannot be found"。
+        let dir = (resource.relativePath as NSString).deletingLastPathComponent
+        let groupKey = dir.isEmpty ? "." : dir
+        if groupMembers[groupKey] == nil {
+            groupMembers[groupKey] = []
+            groupOrder.append(groupKey)
+        }
+        groupMembers[groupKey]?.append(fileRef)
     }
 
+    // 头文件只建立引用（供导航与索引使用），不进 Sources 阶段。
+    for header in spec.headers {
+        let fileRef = xcUUID("fileref", header.relativePath)
+        let name = (header.relativePath as NSString).lastPathComponent
+        fileRefs.append("""
+                \(fileRef) /* \(name) */ = {isa = PBXFileReference; lastKnownFileType = \(header.fileType); path = \(swiftString(name)); sourceTree = "<group>"; };
+        """)
+        let dir = (header.relativePath as NSString).deletingLastPathComponent
+        let groupKey = dir.isEmpty ? "." : dir
+        if groupMembers[groupKey] == nil {
+            groupMembers[groupKey] = []
+            groupOrder.append(groupKey)
+        }
+        groupMembers[groupKey]?.append(fileRef)
+    }
+
+    var frameworkGroupChildren: [String] = []
     for framework in spec.frameworks {
         let fileRef = xcUUID("fileref", framework.name)
         let buildFile = xcUUID("buildfile", framework.name)
+        frameworkGroupChildren.append(fileRef)
         if framework.isSystem {
             fileRefs.append("""
                     \(fileRef) /* \(framework.name).framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = \(swiftString(framework.name + ".framework")); path = \(swiftString(framework.path)); sourceTree = SDKROOT; };
@@ -249,6 +290,22 @@ func generatePBXProj(_ spec: XcodeProjectSpec) -> String {
             };
     """)
 
+    // Frameworks 组：让链接阶段用到的 framework 在导航器里可见。
+    let frameworksGroupUUID = xcUUID("group", "frameworks")
+    if !frameworkGroupChildren.isEmpty {
+        groups.append("""
+                \(frameworksGroupUUID) /* Frameworks */ = {
+                    isa = PBXGroup;
+                    children = (
+        """ + frameworkGroupChildren.map { "                    \($0)," }.joined(separator: "\n") + """
+
+                    );
+                    name = Frameworks;
+                    sourceTree = "<group>";
+                };
+        """)
+    }
+
     for dir in sortedDirs {
         let groupUUID = xcUUID("group", dir)
         let name = (dir as NSString).lastPathComponent
@@ -285,6 +342,9 @@ func generatePBXProj(_ spec: XcodeProjectSpec) -> String {
     for dir in topDirs {
         mainGroupChildren.append(xcUUID("group", dir))
     }
+    if !frameworkGroupChildren.isEmpty {
+        mainGroupChildren.append(frameworksGroupUUID)
+    }
     mainGroupChildren.append(productsGroupUUID)
 
     groups.append("""
@@ -305,26 +365,56 @@ func generatePBXProj(_ spec: XcodeProjectSpec) -> String {
     var ldFlags = spec.otherLDFlags.map { swiftString($0) }.joined(separator: ",\n\t\t\t\t\t")
     if !ldFlags.isEmpty { ldFlags = "\n\t\t\t\t\t" + ldFlags + ",\n\t\t\t\t" }
 
-    var defines = spec.preprocessorDefinitions.map { swiftString($0) }.joined(separator: ",\n\t\t\t\t\t")
+    var defines = spec.preprocessorDefinitions
+        .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        .map { swiftString($0) }
+        .joined(separator: ",\n\t\t\t\t\t")
     if !defines.isEmpty { defines = "\n\t\t\t\t\t" + defines + ",\n\t\t\t\t" }
+
+    var optionalTargetSettings = ""
+    if spec.infoPlistPath.isEmpty {
+        // Xcode 13+ 可以自动生成 Info.plist；没有显式文件时用它，
+        // 否则 ProcessInfoPlistFile 阶段会因为找不到文件而失败。
+        optionalTargetSettings += "                    GENERATE_INFOPLIST_FILE = YES;\n"
+    } else {
+        optionalTargetSettings += "                    INFOPLIST_FILE = \(swiftString(spec.infoPlistPath));\n"
+    }
+    if !spec.bridgingHeader.isEmpty {
+        optionalTargetSettings += "                    SWIFT_OBJC_BRIDGING_HEADER = \(swiftString(spec.bridgingHeader));\n"
+    }
+    if !spec.codeSignEntitlements.isEmpty {
+        optionalTargetSettings += "                    CODE_SIGN_ENTITLEMENTS = \(swiftString(spec.codeSignEntitlements));\n"
+    }
+    if !spec.assetCatalogAppIcon.isEmpty {
+        optionalTargetSettings += "                    ASSETCATALOG_COMPILER_APPICON_NAME = \(swiftString(spec.assetCatalogAppIcon));\n"
+    }
 
     let commonTargetSettings = """
                     CLANG_ENABLE_MODULES = YES;
                     CLANG_ENABLE_OBJC_ARC = \(spec.enableARC ? "YES" : "NO");
                     CODE_SIGNING_ALLOWED = NO;
+                    CODE_SIGNING_REQUIRED = NO;
+                    CODE_SIGN_IDENTITY = "";
                     DEAD_CODE_STRIPPING = NO;
+                    ENABLE_USER_SCRIPT_SANDBOXING = NO;
                     GCC_PREPROCESSOR_DEFINITIONS = (\(defines)"$(inherited)",
                     );
                     HEADER_SEARCH_PATHS = (\(headerPaths)"$(inherited)",
                     );
                     IPHONEOS_DEPLOYMENT_TARGET = \(spec.deploymentTarget);
+                    LD_RUNPATH_SEARCH_PATHS = (
+                        "$(inherited)",
+                        "@executable_path/Frameworks",
+                    );
                     OTHER_LDFLAGS = (\(ldFlags)"$(inherited)",
                     );
                     PRODUCT_BUNDLE_IDENTIFIER = \(swiftString(spec.bundleIdentifier));
                     PRODUCT_NAME = "$(TARGET_NAME)";
                     SDKROOT = iphoneos;
+                    SUPPORTED_PLATFORMS = "iphoneos";
+                    SWIFT_VERSION = \(swiftString(spec.swiftVersion));
                     TARGETED_DEVICE_FAMILY = "1,2";
-    """
+    """ + "\n" + optionalTargetSettings
 
     out.append("// !$*UTF8*$!")
     out.append("{")
@@ -525,7 +615,20 @@ func writeXcodeProject(_ spec: XcodeProjectSpec, projectPath: String) -> (Bool, 
     let xcodeprojDir = "\(projectPath)/\(spec.projectName).xcodeproj"
     cfolder(atPath: xcodeprojDir)
 
-    let content = generatePBXProj(spec)
+    // pbxproj 里的路径必须相对 SRCROOT，否则工程拷到 Mac 后全部失效。
+    var normalized = spec
+    func localize(_ path: String) -> String {
+        if path == projectPath { return "" }
+        if path.hasPrefix(projectPath + "/") {
+            return String(path.dropFirst(projectPath.count + 1))
+        }
+        return path
+    }
+    normalized.infoPlistPath = localize(spec.infoPlistPath)
+    normalized.bridgingHeader = localize(spec.bridgingHeader)
+    normalized.codeSignEntitlements = localize(spec.codeSignEntitlements)
+
+    let content = generatePBXProj(normalized)
     cfile(atPath: "\(xcodeprojDir)/project.pbxproj", withContent: content)
 
     // 同时写入共享 scheme，方便在 Xcode 里直接打开就能 Run
@@ -575,69 +678,109 @@ func writeXcodeProject(_ spec: XcodeProjectSpec, projectPath: String) -> (Bool, 
 struct ProjectDependencies {
     var systemFrameworks: [String] = []      // UIKit / Foundation ...
     var localFrameworks: [String] = []       // 工程内 .framework 名字
-    var headerSearchPaths: [String] = []     // 含头文件的目录（绝对路径）
+    var localFrameworkPaths: [String] = []   // 工程内 .framework 相对路径
+    var headerSearchPaths: [String] = []     // 含头文件的目录（$(SRCROOT)/...）
     var otherLDFlags: [String] = []          // -L / -l / -Wl,-U
+}
+
+/// 已安装 SDK 里真实存在的 framework 名字。
+/// 用来过滤 `import Foo`：只有 SDK 里有的才转成 -framework，
+/// 否则本地模块 / SPM 包会被误当成系统框架。
+private func availableSDKFrameworkNames() -> Set<String> {
+    let fm = FileManager.default
+    var names = Set<String>()
+    guard let sdks = try? fm.contentsOfDirectory(atPath: global_sdkpath) else { return names }
+    for sdk in sdks where sdk.hasPrefix("iPhoneOS") && sdk.hasSuffix(".sdk") {
+        for sub in ["System/Library/Frameworks", "System/Library/PrivateFrameworks"] {
+            let dir = "\(global_sdkpath)/\(sdk)/\(sub)"
+            guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for entry in entries where entry.hasSuffix(".framework") {
+                names.insert((entry as NSString).deletingPathExtension)
+            }
+        }
+    }
+    return names
 }
 
 /// 扫描源码里的 import，推断需要的系统框架与头文件路径
 func loadProjectDependencies(projectPath: String) -> ProjectDependencies {
     let fm = FileManager.default
     var deps = ProjectDependencies()
-
-    let ignore = ["Resources", ".git", "build", "Payload", "clang", ".fcm-cache", ".fcm-errors", "node_modules"]
+    let ignore = makeBuildIgnoreList("")
     guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else { return deps }
 
-    // ---- 1) 系统框架：从 #import <XXX/YYY.h> 推断 ----
-    var frameworks = Set<String>()
-    let frameworkHints: [String: String] = [
-        "UIKit": "UIKit", "Foundation": "Foundation", "SwiftUI": "SwiftUI",
-        "Security": "Security", "Network": "Network", "QuartzCore": "QuartzCore",
-        "AVFoundation": "AVFoundation", "AVFAudio": "AVFAudio", "ImageIO": "ImageIO",
-        "SafariServices": "SafariServices", "UserNotifications": "UserNotifications",
-        "BackgroundTasks": "BackgroundTasks", "UniformTypeIdentifiers": "UniformTypeIdentifiers",
-        "CoreGraphics": "CoreGraphics", "Metal": "Metal", "MetalKit": "MetalKit",
-        "OpenGLES": "OpenGLES", "AudioToolbox": "AudioToolbox", "CoreAudio": "CoreAudio",
-        "VideoToolbox": "VideoToolbox", "CoreMedia": "CoreMedia", "WebKit": "WebKit",
-        "AuthenticationServices": "AuthenticationServices", "LocalAuthentication": "LocalAuthentication"
+    // ---- 1) 系统框架：从 #import <XXX/YYY.h> 与 Swift import 推断 ----
+    var imported = Set<String>()
+    let objcPatterns = [
+        "#(?:import|include)\\s+<([^/]+)/[^>]+>",
+        "@import\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*;"
+    ]
+    let swiftPatterns = [
+        "^[ \\t]*(?:@_exported[ \\t]+)?import[ \\t]+(?:struct|class|enum|protocol|typealias|func|var|let)[ \\t]+([A-Za-z_][A-Za-z0-9_]*)",
+        "^[ \\t]*(?:@_exported[ \\t]+)?import[ \\t]+([A-Za-z_][A-Za-z0-9_]*)"
     ]
 
-    for file in all where file.hasSuffix(".m") || file.hasSuffix(".h") || file.hasSuffix(".mm") || file.hasSuffix(".swift") {
-        if ignore.contains(where: { file.hasPrefix($0 + "/") }) { continue }
+    for file in all where ["m", "h", "mm", "swift"].contains((file as NSString).pathExtension.lowercased()) {
+        if isPathIgnored(file, prefixes: ignore) { continue }
         let full = "\(projectPath)/\(file)"
         guard let text = try? String(contentsOfFile: full, encoding: .utf8) else { continue }
-        for (key, framework) in frameworkHints where text.contains("<" + key + "/") || text.contains("import " + key) {
-            frameworks.insert(framework)
+        let ns = text as NSString
+        let range = NSRange(location: 0, length: ns.length)
+        for pattern in objcPatterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { continue }
+            for match in regex.matches(in: text, options: [], range: range) where match.numberOfRanges == 2 {
+                imported.insert(ns.substring(with: match.range(at: 1)))
+            }
+        }
+        for pattern in swiftPatterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]) else { continue }
+            for match in regex.matches(in: text, options: [], range: range) where match.numberOfRanges == 2 {
+                imported.insert(ns.substring(with: match.range(at: 1)))
+            }
         }
     }
-    deps.systemFrameworks = frameworks.sorted()
+
+    let available = availableSDKFrameworkNames()
+    if available.isEmpty {
+        // SDK 没安装时退回已知列表，至少保证导出的工程能链接基础框架
+        let hints: Set<String> = ["UIKit", "Foundation", "SwiftUI", "QuartzCore", "CoreGraphics",
+                                  "Security", "Network", "WebKit", "LocalAuthentication"]
+        deps.systemFrameworks = imported.intersection(hints).sorted()
+    } else {
+        deps.systemFrameworks = imported.intersection(available).sorted()
+    }
 
     // ---- 2) 工程内 .framework ----
-    var localFW = Set<String>()
-    for file in all where file.hasSuffix(".framework") {
-        if ignore.contains(where: { file.hasPrefix($0 + "/") }) { continue }
-        let name = ((file as NSString).lastPathComponent as NSString).deletingPathExtension
-        localFW.insert(name)
+    let localFW = collectIOSFrameworks(projectPath: projectPath, ignorePrefixes: ignore)
+    deps.localFrameworks = localFW.map { $0.name }
+    deps.localFrameworkPaths = localFW.map { item in
+        let frameworkDir = (item.path as NSString).deletingLastPathComponent
+        if frameworkDir.hasPrefix(projectPath + "/") {
+            return String(frameworkDir.dropFirst(projectPath.count + 1))
+        }
+        return frameworkDir
     }
-    deps.localFrameworks = localFW.sorted()
 
-    // ---- 3) 头文件搜索路径：含 .h 的目录 ----
+    // ---- 3) 头文件搜索路径：含头文件的目录 ----
     var headers = Set<String>()
-    for file in all where file.hasSuffix(".h") {
-        if ignore.contains(where: { file.hasPrefix($0 + "/") }) { continue }
+    for file in all where ["h", "hh", "hpp"].contains((file as NSString).pathExtension.lowercased()) {
+        if isPathIgnored(file, prefixes: ignore) { continue }
         let dir = (file as NSString).deletingLastPathComponent
-        if !dir.isEmpty { headers.insert("\(projectPath)/\(dir)") }
+        let relative = dir.isEmpty ? "$(SRCROOT)" : "$(SRCROOT)/\(dir)"
+        headers.insert(relative)
     }
     deps.headerSearchPaths = headers.sorted()
 
     // ---- 4) 静态库：复用平台筛选，避免把 lib-macos 之类链进 iOS 工程 ----
     let iosLibs = collectIOSStaticLibraries(projectPath: projectPath, ignorePrefixes: ignore)
+        + collectIOSStaticFromXCFrameworks(projectPath: projectPath, ignorePrefixes: ignore)
     var libDirs = Set<String>()
     for file in iosLibs {
         let dir = (file as NSString).deletingLastPathComponent
-        if !dir.isEmpty { libDirs.insert("\(projectPath)/\(dir)") }
+        if !dir.isEmpty { libDirs.insert(dir) }
     }
     for dir in libDirs.sorted() {
-        deps.otherLDFlags.append("-L" + dir)
+        deps.otherLDFlags.append("-L$(SRCROOT)/\(dir)")
     }
     for file in iosLibs {
         let base = ((file as NSString).lastPathComponent as NSString).deletingPathExtension
@@ -650,12 +793,25 @@ func loadProjectDependencies(projectPath: String) -> ProjectDependencies {
     return deps
 }
 
+/// 工程里是否存在 AppIcon.appiconset
+private func projectHasAppIcon(_ projectPath: String) -> Bool {
+    let fm = FileManager.default
+    guard let enumerator = fm.enumerator(atPath: projectPath) else { return false }
+    for case let entry as String in enumerator {
+        if let last = entry.split(separator: "/").last, last == "AppIcon.appiconset" {
+            return true
+        }
+    }
+    return false
+}
+
 /// 从工程目录收集生成 pbxproj 所需的文件清单
 func buildProjectSpec(projectName: String,
                       projectPath: String,
                       bundleIdentifier: String,
                       deploymentTarget: String) -> XcodeProjectSpec {
-    let ignore = ["Resources", ".git", "build", "Payload", "clang", ".fcm-cache", ".fcm-errors", "node_modules"]
+    // Resources 目录本身就是资源来源，不能像构建扫描那样整个忽略。
+    let ignore = buildIgnoredDirectories.filter { $0 != "Resources" }
     var spec = XcodeProjectSpec(projectName: projectName,
                                 bundleIdentifier: bundleIdentifier,
                                 deploymentTarget: deploymentTarget,
@@ -664,25 +820,86 @@ func buildProjectSpec(projectName: String,
     let fm = FileManager.default
     guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else { return spec }
 
-    for file in all {
-        if ignore.contains(where: { file.hasPrefix($0 + "/") }) { continue }
-        if file.contains(".xcodeproj/") || file.hasPrefix(".") { continue }
-        let low = file.lowercased()
+    let sourceExtensions: Set<String> = ["m", "mm", "c", "cc", "cpp", "cxx", "swift", "s", "metal"]
+    let headerExtensions: Set<String> = ["h", "hh", "hpp", "hxx"]
+    let resourceExtensions: Set<String> = [
+        "xcassets", "storyboard", "xib", "strings", "stringsdict", "png", "jpg", "jpeg",
+        "gif", "webp", "pdf", "ttf", "otf", "ttc", "json", "plist", "html", "css", "js", "svg",
+        "mp3", "wav", "caf", "m4a", "mp4", "mov", "bundle", "scn", "usdz", "reality", "skybox"
+    ]
+    let excludedNames: Set<String> = ["Info.plist", "DontTouchMe.plist", "api.api"]
 
-        if low.hasSuffix(".m") || low.hasSuffix(".mm") || low.hasSuffix(".c")
-            || low.hasSuffix(".cpp") || low.hasSuffix(".swift") {
+    for file in all {
+        if isPathIgnored(file, prefixes: ignore) { continue }
+        if file.contains(".xcodeproj/") || file.hasPrefix(".") { continue }
+        if file.split(separator: "/").contains(where: { $0.hasPrefix(".") }) { continue }
+        // 资源包内部的文件不能逐个挂进 Resources 阶段，
+        // 否则 Assets.car / bundle 的结构会被打散。
+        if file.contains(".xcassets/") || file.contains(".bundle/") ||
+           file.contains(".framework/") || file.contains(".xcframework/") {
+            continue
+        }
+
+        let ext = (file as NSString).pathExtension.lowercased()
+        let name = (file as NSString).lastPathComponent
+
+        if sourceExtensions.contains(ext) {
             spec.sources.append(XcodeSourceFile(relativePath: file, fileType: xcodeFileType(for: file)))
-        } else if low.hasSuffix(".xcassets") && !file.contains("/") {
-            spec.resources.append(XcodeResourceFile(relativePath: file, fileType: "folder.assetcatalog", isFolder: true))
-        } else if low.hasSuffix(".storyboard") || low.hasSuffix(".xib")
-                    || low.hasSuffix(".strings") || low.hasSuffix(".plist") && !file.contains("Resources/") {
-            if !file.contains("Info.plist") {
-                spec.resources.append(XcodeResourceFile(relativePath: file, fileType: xcodeFileType(for: file)))
-            }
+        } else if headerExtensions.contains(ext) {
+            spec.headers.append(XcodeSourceFile(relativePath: file, fileType: xcodeFileType(for: file)))
+        } else if excludedNames.contains(name) || name == "entitlements.plist" || ext == "xcconfig" {
+            continue
+        } else if resourceExtensions.contains(ext) || file.hasPrefix("Resources/") {
+            let isFolder = ["xcassets", "bundle", "atlas"].contains(ext)
+            spec.resources.append(XcodeResourceFile(relativePath: file,
+                                                    fileType: xcodeFileType(for: file),
+                                                    isFolder: isFolder))
         }
     }
 
+    // Info.plist / 桥接头 / entitlements：优先工程约定位置
+    let resourcesInfo = "\(projectPath)/Resources/Info.plist"
+    if fm.fileExists(atPath: resourcesInfo) {
+        spec.infoPlistPath = resourcesInfo
+    }
+    let bridge = "\(projectPath)/bridge.h"
+    if fm.fileExists(atPath: bridge) {
+        spec.bridgingHeader = bridge
+    }
+    let entitlements = "\(projectPath)/entitlements.plist"
+    if fm.fileExists(atPath: entitlements) {
+        spec.codeSignEntitlements = entitlements
+    }
+    if projectHasAppIcon(projectPath) {
+        spec.assetCatalogAppIcon = "AppIcon"
+    }
+
+    // api.api 里显式关闭 ARC 时，导出的工程也要一致
+    let apiPath = "\(projectPath)/api.api"
+    if let apiText = try? String(contentsOfFile: apiPath, encoding: .utf8) {
+        let flag = tags(apiText, "noarc").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if flag == "true" || flag == "1" || flag == "yes" {
+            spec.enableARC = false
+        }
+    }
+
+    // 调用方没显式提供依赖时，用扫描结果补齐，保证单独调用也能生成可编译的工程
+    let deps = loadProjectDependencies(projectPath: projectPath)
+    if spec.frameworks.isEmpty {
+        spec.frameworks = deps.systemFrameworks.map {
+            XcodeFrameworkRef(name: $0, path: "System/Library/Frameworks/\($0).framework", isSystem: true)
+        }
+        for (index, name) in deps.localFrameworks.enumerated() where index < deps.localFrameworkPaths.count {
+            spec.frameworks.append(XcodeFrameworkRef(name: name,
+                                                     path: deps.localFrameworkPaths[index],
+                                                     isSystem: false))
+        }
+    }
+    if spec.headerSearchPaths.isEmpty { spec.headerSearchPaths = deps.headerSearchPaths }
+    if spec.otherLDFlags.isEmpty { spec.otherLDFlags = deps.otherLDFlags }
+
     spec.sources.sort { $0.relativePath < $1.relativePath }
+    spec.headers.sort { $0.relativePath < $1.relativePath }
     spec.resources.sort { $0.relativePath < $1.relativePath }
     return spec
 }

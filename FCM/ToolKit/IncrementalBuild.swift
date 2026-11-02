@@ -78,24 +78,28 @@ func sourceFingerprint(projectPath: String, relativePath: String, flagsToken: St
     let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
     let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
 
-    // 用 内容首尾片段 + 大小 + 修改时间 组成指纹：
-    // 比整文件哈希快，且足以发现改动（Xcode 也依赖 mtime）
-    var contentSample = ""
+    // 用 内容首尾片段的哈希 + 大小 + 修改时间 组成指纹：
+    // 比整文件哈希快，又比只看 mtime 可靠（编辑器保存时 mtime 精度可能不够）。
+    var contentHash: UInt32 = 2166136261
     if let handle = FileHandle(forReadingAtPath: full) {
+        func feed(_ data: Data) {
+            for byte in data {
+                contentHash ^= UInt32(byte)
+                contentHash = contentHash &* 16777619
+            }
+        }
         let head = handle.readData(ofLength: 2048)
+        feed(head)
         handle.seekToEndOfFile()
         let fileSize = Int(handle.offsetInFile)
         if fileSize > 2048 {
             handle.seek(toFileOffset: UInt64(max(0, fileSize - 1024)))
-            let tail = handle.readDataToEndOfFile()
-            contentSample = String(data: head + tail, encoding: .utf8) ?? ""
-        } else {
-            contentSample = String(data: head, encoding: .utf8) ?? ""
+            feed(handle.readDataToEndOfFile())
         }
         handle.closeFile()
     }
 
-    let raw = "\(relativePath)|\(size)|\(mtime)|\(flagsToken)|\(contentSample.count)"
+    let raw = "\(relativePath)|\(size)|\(mtime)|\(flagsToken)|\(String(format: "%08x", contentHash))"
     // FNV-1a：跨进程稳定（String.hashValue 每次启动都会变，不能用于持久化）
     var hash: UInt32 = 2166136261
     for byte in raw.utf8 {
@@ -117,7 +121,6 @@ func planCompilation(projectPath: String,
     cfolder(atPath: objectDir)
 
     let previous = forceFull ? BuildState() : BuildState.load(projectPath)
-    var nextState = BuildState()
     var units: [CompileUnit] = []
     var reused = 0
     var rebuilt = 0
@@ -126,7 +129,6 @@ func planCompilation(projectPath: String,
         let fingerprint = sourceFingerprint(projectPath: projectPath,
                                             relativePath: source,
                                             flagsToken: flagsToken)
-        nextState.entries[source] = fingerprint
 
         // 目标 .o 用源路径的稳定哈希命名，保证多次构建指向同一个文件
         let objectName = stableObjectName(source)
@@ -149,8 +151,53 @@ func planCompilation(projectPath: String,
         }
     }
 
-    nextState.save(projectPath)
     return (units, reused, rebuilt)
+}
+
+/// 编译/链接全部成功后再写增量状态。
+///
+/// 关键点：不能在计划阶段就写。否则某个文件编译失败时，
+/// 它的新指纹已经落盘、旧的 .o 还在，下一次构建会误判为“未改动”而直接复用旧产物。
+func saveBuildState(projectPath: String, sources: [String], flagsToken: String) {
+    var state = BuildState()
+    for source in sources {
+        state.entries[source] = sourceFingerprint(projectPath: projectPath,
+                                                  relativePath: source,
+                                                  flagsToken: flagsToken)
+    }
+    state.save(projectPath)
+}
+
+/// 工程内所有头文件的组合指纹。
+///
+/// 增量编译只看 .m 自身的话，改头文件不会触发重编，
+/// 会复用按旧头文件生成的 .o（Xcode 靠 dep 文件解决，这里用保守做法：
+/// 任一头文件变化就让本轮所有 ObjC 单元重编）。
+func projectHeadersFingerprint(projectPath: String, ignorePrefixes: [String]) -> String {
+    let fm = FileManager.default
+    guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else { return "" }
+    let headers = all
+        .filter {
+            let ext = ($0 as NSString).pathExtension.lowercased()
+            return ext == "h" || ext == "hh" || ext == "hpp" || ext == "hxx"
+        }
+        .filter { !isPathIgnored($0, prefixes: ignorePrefixes) }
+        .sorted()
+
+    var combined = ""
+    for header in headers {
+        combined += sourceFingerprint(projectPath: projectPath,
+                                      relativePath: header,
+                                      flagsToken: "")
+        combined += "|"
+    }
+
+    var hash: UInt32 = 2166136261
+    for byte in combined.utf8 {
+        hash ^= UInt32(byte)
+        hash = hash &* 16777619
+    }
+    return String(format: "%08x", hash)
 }
 
 /// 把源文件路径映射成稳定的 .o 文件名

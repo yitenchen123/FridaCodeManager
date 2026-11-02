@@ -173,12 +173,12 @@ func collectIOSStaticLibraries(projectPath: String, ignorePrefixes: [String]) ->
     let fm = FileManager.default
     guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else { return [] }
 
-    let ignoreSet = Set(ignorePrefixes.filter { !$0.isEmpty })
+    let ignoreList = makeBuildIgnoreList("") + ignorePrefixes
     var result: [String] = []
 
     for file in all where file.hasSuffix(".a") {
-        // 用户配置的忽略项
-        if ignoreSet.contains(where: { file.hasPrefix($0) }) { continue }
+        // 用户配置的忽略项 + 构建产物目录
+        if isPathIgnored(file, prefixes: ignoreList) { continue }
 
         // 路径明显属于其他平台
         if pathHasForeignPlatform(file) { continue }
@@ -231,11 +231,11 @@ func machoPlatformOnly(_ path: String) -> String? {
 func collectIOSStaticFromXCFrameworks(projectPath: String, ignorePrefixes: [String]) -> [String] {
     let fm = FileManager.default
     guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else { return [] }
-    let ignoreSet = Set(ignorePrefixes.filter { !$0.isEmpty })
+    let ignoreList = makeBuildIgnoreList("") + ignorePrefixes
 
     var result: [String] = []
     for entry in all where entry.hasSuffix(".xcframework") {
-        if ignoreSet.contains(where: { entry.hasPrefix($0) }) { continue }
+        if isPathIgnored(entry, prefixes: ignoreList) { continue }
 
         let xcfPath = "\(projectPath)/\(entry)"
         var isDir: ObjCBool = false
@@ -270,13 +270,13 @@ func collectIOSStaticFromXCFrameworks(projectPath: String, ignorePrefixes: [Stri
 func collectIOSFrameworks(projectPath: String, ignorePrefixes: [String]) -> [(name: String, path: String)] {
     let fm = FileManager.default
     guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else { return [] }
-    let ignoreSet = Set(ignorePrefixes.filter { !$0.isEmpty })
+    let ignoreList = makeBuildIgnoreList("") + ignorePrefixes
 
     var seen = Set<String>()
     var result: [(String, String)] = []
 
     for entry in all where entry.hasSuffix(".framework") {
-        if ignoreSet.contains(where: { entry.hasPrefix($0) }) { continue }
+        if isPathIgnored(entry, prefixes: ignoreList) { continue }
         if pathHasForeignPlatform(entry) { continue }
 
         let frameworkPath = "\(projectPath)/\(entry)"
