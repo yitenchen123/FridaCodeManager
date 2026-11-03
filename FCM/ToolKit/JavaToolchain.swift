@@ -43,6 +43,7 @@ struct JavaToolchainInfo {
     var jarPath: String?
     var version: String = ""  // 如 "1.8.0_392" / "17.0.9"
     var supportsJava8Target: Bool = false
+    var java8Flags: [String] = []   // 实际可用的 Java 8 编译参数
     var source: String = ""   // 说明来自哪里
 
     var ready: Bool { return javacPath != nil && jarPath != nil }
@@ -50,70 +51,44 @@ struct JavaToolchainInfo {
 
 // MARK: - 探测
 
-/// 探测设备上可用的 JDK
-/// 优先级：
-///   1. 工程自带 JRE（java_runtimes/、jre*、JavaApp/jre*）
-///   2. 系统路径里的 javac（apt 安装的 openjdk）
-///   3. FCM 固定目录（用户手动放置）
+/// 探测设备上可用的 JDK。
+///
+/// Air2 的启动核心必须产出 Java 8 字节码（major 52），这样内嵌的
+/// OpenJDK 8/17/21 都能加载。JDK 8 本身用 -source 8 -target 8；
+/// 新版本 JDK 优先用 --release 8（会正确限制 API，避免编到不存在的方法）。
+/// 因此这里把「能编译 Java 8」当作硬条件，并优先选择 JDK 8。
 func detectJavaToolchain(projectPath: String) -> JavaToolchainInfo {
     let fm = FileManager.default
     var info = JavaToolchainInfo()
 
-    // ---- 0) 优先检查标准 JDK 布局（bin/javac + lib/tools.jar）----
-    // 这是完整的 JDK，能真正运行 javac（javac 自身是依赖 tools.jar 的 Java 程序）。
-    // 常见放置位置：
-    //   <工程>/.fcm-jdk/            FCM 推荐位置
-    //   <工程>/jdk8/                工程自带
-    //   Documents/.fcm-jdk/         全局共享
-    // 用户通过「设置 > Java 环境」导入的 JDK 优先；
-    // 其次是工程自带的位置。
-    let standardJDKCandidates = [
-        "\(global_documents)/.fcm-jdk",   // FCM 导入的目标位置
-        "\(projectPath)/.fcm-jdk",
-        "\(projectPath)/jdk8",
-        "\(projectPath)/jdk",
-        "\(Bundle.main.bundlePath)/jdk8"  // 若将来内置则可用
-    ]
-    for candidate in standardJDKCandidates {
-        let javac = "\(candidate)/bin/javac"
-        let tools = "\(candidate)/lib/tools.jar"
+    var candidates: [(home: String, source: String, priority: Int)] = []
+    var seen = Set<String>()
 
-        // 用「文件存在」而不是「可执行」判断：
-        // 从 zip 解压出来的文件是 644，没有执行位，
-        // 用 isExecutableFile 会把刚导入的 JDK 直接跳过。
-        guard fm.fileExists(atPath: javac) else { continue }
-
-        // 发现 JDK 后补执行权限（幂等）
-        shell("chmod -R +x '\(candidate)/bin' 2>/dev/null", uid: 501, env: [])
-        #if !stock
-        if !fm.isExecutableFile(atPath: javac) {
-            shell("chmod -R +x '\(candidate)/bin' 2>/dev/null", uid: 0, env: [])
+    func addCandidate(_ home: String, _ source: String, priority: Int) {
+        // 注意：不能用 trimmingCharacters 去斜杠，那会把 "/usr/lib/jvm/x" 变成
+        // 相对路径 "usr/lib/jvm/x"，后面 fileExists 全部失败。
+        var normalized = (home as NSString).standardizingPath
+        while normalized.count > 1 && normalized.hasSuffix("/") {
+            normalized.removeLast()
         }
-        #endif
-
-        // 完整 JDK 应同时具备 tools.jar（javac 的实现）
-        let isFullJDK = fm.fileExists(atPath: tools)
-
-        info.home = candidate
-        info.javacPath = javac
-        info.jarPath = fm.fileExists(atPath: "\(candidate)/bin/jar") ? "\(candidate)/bin/jar" : nil
-        info.source = isFullJDK ? "标准 JDK（含 tools.jar）" : "JDK 布局"
-        if candidate.hasPrefix(Bundle.main.bundlePath) {
-            info.source += "，随 FCM 内置"
-        }
-
-        let versionResult = runCaptured("'\(javac)' -version", uid: 501)
-        if let range = versionResult.output.range(of: "javac ") {
-            info.version = String(versionResult.output[range.upperBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        let probe = runCaptured("'\(javac)' -source 8 -target 8 -version", uid: 501)
-        info.supportsJava8Target = probe.succeeded
-        return info
+        guard seen.insert(normalized).inserted else { return }
+        guard fm.fileExists(atPath: "\(normalized)/bin/javac") else { return }
+        candidates.append((normalized, source, priority))
     }
 
-    // ---- 1) 工程自带的 JRE ----
-    var candidates: [(String, String)] = []   // (home, 来源说明)
+    // ---- 0) 标准 JDK 布局（用户导入 / 工程自带 / 内置）----
+    let standardJDKCandidates = [
+        ("\(global_documents)/.fcm-jdk", "FCM 目录（用户导入）", 40),
+        ("\(projectPath)/.fcm-jdk", "工程目录 .fcm-jdk", 30),
+        ("\(projectPath)/jdk8", "工程自带 jdk8", 25),
+        ("\(projectPath)/jdk", "工程自带 jdk", 20),
+        ("\(Bundle.main.bundlePath)/jdk8", "FCM 内置 JDK", 35)
+    ]
+    for candidate in standardJDKCandidates {
+        addCandidate(candidate.0, candidate.1, priority: candidate.2)
+    }
+
+    // ---- 1) 工程自带的 JRE/JDK ----
     let searchRoots = [
         "\(projectPath)/java_runtimes",
         "\(projectPath)/JavaApp",
@@ -128,84 +103,128 @@ func detectJavaToolchain(projectPath: String) -> JavaToolchainInfo {
             let full = "\(root)/\(entry)"
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: full, isDirectory: &isDir), isDir.boolValue else { continue }
-            // 可能是多版本目录（java_runtimes/8、/17）
+
             if fm.fileExists(atPath: "\(full)/bin/javac") {
-                candidates.append((full, "工程自带：" + entry))
+                addCandidate(full, "工程自带：\(entry)", priority: 15)
             } else if let subs = try? fm.contentsOfDirectory(atPath: full) {
                 for sub in subs where fm.fileExists(atPath: "\(full)/\(sub)/bin/javac") {
-                    candidates.append(("\(full)/\(sub)", "工程自带：" + entry + "/" + sub))
+                    addCandidate("\(full)/\(sub)", "工程自带：\(entry)/\(sub)", priority: 15)
                 }
             }
         }
     }
 
     // ---- 2) 系统路径 ----
+    // JAVA_HOME 与 PATH 里的 javac 也要认：Linux 上 JDK 常装在
+    // /usr/lib/jvm 之外（如 SDKMAN / mise），而 iOS 上也可能通过 PATH 暴露。
+    if let javaHome = ProcessInfo.processInfo.environment["JAVA_HOME"], !javaHome.isEmpty {
+        addCandidate(javaHome, "JAVA_HOME", priority: 10)
+    }
+    let pathDirectories = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
+    for directory in pathDirectories {
+        let javac = "\(directory)/javac"
+        guard fm.fileExists(atPath: javac) else { continue }
+        let realJavac = (javac as NSString).resolvingSymlinksInPath
+        let home = ((realJavac as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
+        addCandidate(home, "PATH：\(directory)", priority: 10)
+    }
+
     let systemRoots = [
-        "/var/jb/usr/lib/jvm", "/usr/lib/jvm", "/var/jb/opt", "/opt"
+        "\(jbroot)/usr/lib/jvm", "/var/jb/usr/lib/jvm", "/usr/lib/jvm",
+        "\(jbroot)/opt", "/opt"
     ]
     for root in systemRoots {
         guard let entries = try? fm.contentsOfDirectory(atPath: root) else { continue }
         for entry in entries {
-            let full = "\(root)/\(entry)"
-            if fm.fileExists(atPath: "\(full)/bin/javac") {
-                candidates.append((full, "系统安装：" + entry))
-            }
+            addCandidate("\(root)/\(entry)", "系统安装：\(entry)", priority: 5)
         }
     }
 
     // ---- 3) 直接的 javac 命令 ----
-    let directJavac = ["/var/jb/usr/bin/javac", "/usr/bin/javac"]
-        .first { fm.isExecutableFile(atPath: $0) }
-    if let javac = directJavac {
-        // 从 /usr/bin/javac 反推 JDK home
+    for javac in ["\(jbroot)/usr/bin/javac", "/var/jb/usr/bin/javac", "/usr/bin/javac"] {
+        guard fm.fileExists(atPath: javac) else { continue }
         let home = ((javac as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
-        candidates.append((home, "系统 PATH"))
+        addCandidate(home, "系统 PATH", priority: 5)
     }
 
-    // ---- 4) FCM 固定目录（用户手动放置）----
-    let userJDK = "\(global_documents)/.fcm-jdk"
-    if fm.fileExists(atPath: "\(userJDK)/bin/javac") {
-        candidates.append((userJDK, "FCM 目录（用户放置）"))
-    }
+    guard !candidates.isEmpty else { return info }
 
-    guard let chosen = candidates.first else {
-        return info
-    }
+    // ---- 4) 依次评估，优先 JDK 8 ----
+    var best: (JavaToolchainInfo, Int)?
+    for candidate in candidates {
+        var current = JavaToolchainInfo()
+        current.home = candidate.home
+        current.source = candidate.source
+        current.javacPath = "\(candidate.home)/bin/javac"
+        current.jarPath = fm.fileExists(atPath: "\(candidate.home)/bin/jar")
+            ? "\(candidate.home)/bin/jar" : nil
 
-    info.home = chosen.0
-    info.source = chosen.1
-    info.javacPath = "\(chosen.0)/bin/javac"
-    if fm.exists(javac: info.javacPath!) == false {
-        info.javacPath = nil
-    }
-    let jarCandidate = "\(chosen.0)/bin/jar"
-    info.jarPath = fm.isExecutableFile(atPath: jarCandidate) ? jarCandidate : nil
+        // zip 解压出来的 bin 往往没有执行位，补一次（幂等）
+        _ = shell("chmod -R +x \(shellQuote("\(candidate.home)/bin")) 2>/dev/null", uid: 501, env: [])
 
-    // 读取版本
-    if let javac = info.javacPath {
-        let result = runCaptured("'\(javac)' -version", uid: 501)
-        // javac -version 输出到 stderr，runCaptured 已合并
-        let text = result.output
-        if let range = text.range(of: "javac ") {
-            info.version = String(text[range.upperBound...])
+        let versionResult = runCaptured("\(shellQuote(current.javacPath!)) -version", uid: 501)
+        if let range = versionResult.output.range(of: "javac ") {
+            current.version = String(versionResult.output[range.upperBound...])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        // 检查能否产出 Java 8 字节码：
-        // JDK 9+ 支持 -source 8；JDK 8 本身就支持
-        let probe = runCaptured("'\(javac)' -source 8 -target 8 -version", uid: 501)
-        info.supportsJava8Target = probe.succeeded
+        let major = javaMajorVersion(current.version)
+
+        // 先选参数模式，再真正验证 javac 接受它
+        if major == 8 {
+            current.java8Flags = ["-source", "8", "-target", "8"]
+        } else if major >= 9 {
+            let releaseProbe = runCaptured(
+                "\(shellQuote(current.javacPath!)) --release 8 -version", uid: 501)
+            if releaseProbe.succeeded {
+                current.java8Flags = ["--release", "8"]
+            } else {
+                let sourceTargetProbe = runCaptured(
+                    "\(shellQuote(current.javacPath!)) -source 8 -target 8 -version", uid: 501)
+                if sourceTargetProbe.succeeded {
+                    current.java8Flags = ["-source", "8", "-target", "8"]
+                }
+            }
+        } else if major > 0 {
+            // 未知版本号时两种都试
+            if runCaptured("\(shellQuote(current.javacPath!)) --release 8 -version", uid: 501).succeeded {
+                current.java8Flags = ["--release", "8"]
+            } else if runCaptured("\(shellQuote(current.javacPath!)) -source 8 -target 8 -version", uid: 501).succeeded {
+                current.java8Flags = ["-source", "8", "-target", "8"]
+            }
+        }
+        current.supportsJava8Target = !current.java8Flags.isEmpty
+
+        guard current.ready, current.supportsJava8Target else { continue }
+
+        // 评分：JDK 8 最高；其余能用 --release 8 的新 JDK 次之；来源优先级做微调
+        var score = candidate.priority
+        if major == 8 {
+            score += 300
+        } else if major >= 9 {
+            score += 200
+        } else {
+            score += 100
+        }
+        if best == nil || score > best!.1 {
+            best = (current, score)
+        }
     }
 
+    if let best = best {
+        info = best.0
+    }
     return info
 }
 
-// MARK: - 工具函数
-
-private extension FileManager {
-    /// 判断路径是否可执行的小工具
-    func exists(javac path: String) -> Bool {
-        return isExecutableFile(atPath: path)
+/// 从 javac 版本字符串取出主版本号（"1.8.0_392" → 8，"17.0.9" → 17）
+private func javaMajorVersion(_ version: String) -> Int {
+    let text = version.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else { return 0 }
+    let parts = text.split(separator: ".")
+    if parts.first == "1", parts.count > 1 {
+        return Int(parts[1]) ?? 0
     }
+    return Int(parts[0]) ?? 0
 }
 
 // MARK: - 报告
@@ -215,9 +234,10 @@ func describeJavaToolchain(_ info: JavaToolchainInfo) -> String {
     if !info.ready {
         var text = "未找到可用的 JDK（需要 javac 与 jar）\n"
         text += "安装方式（任选其一）：\n"
-        text += "  · 在设备终端执行：apt install openjdk-17（或 openjdk-11 / openjdk-8）\n"
+        text += "  · 在「设置 > Java 环境」导入 JDK 8（iOS aarch64 版 OpenJDK 8）\n"
+        text += "  · 在设备终端执行：apt install openjdk-8（没有则用 openjdk-17）\n"
         text += "  · 把 JDK 解压到 \(global_documents)/.fcm-jdk/ 或 <工程>/.fcm-jdk/\n"
-        text += "    （要求含 bin/javac 与 lib/tools.jar；iOS aarch64 版 OpenJDK 8 可用）\n"
+        text += "    （要求含 bin/javac 与 bin/jar）\n"
         text += "  · 工程内放置 java_runtimes/<版本>/ 目录\n"
         return text
     }
@@ -225,7 +245,8 @@ func describeJavaToolchain(_ info: JavaToolchainInfo) -> String {
     var text = "JDK：\(info.version.isEmpty ? "未知版本" : info.version)\n"
     text += "来源：\(info.source)\n"
     text += "路径：\(info.home ?? "-")\n"
-    text += "Java 8 目标：\(info.supportsJava8Target ? "支持（-source 8 -target 8）" : "不支持")"
+    let flags = info.java8Flags.joined(separator: " ")
+    text += "Java 8 目标：\(info.supportsJava8Target ? "支持（\(flags)）" : "不支持")"
     return text
 }
 

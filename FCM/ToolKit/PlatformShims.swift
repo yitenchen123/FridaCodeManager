@@ -187,7 +187,7 @@ func installPlatformShims(projectPath: String) -> (dir: String, shims: [Platform
     for shim in shims {
         let path = "\(dir)/\(shim.name)"
         cfile(atPath: path, withContent: shim.script)
-        shell("chmod +x '\(path)'", uid: 501, env: [])
+        _ = shell("chmod +x '\(path)'", uid: 501, env: [])
     }
 
     // /usr/libexec/java_home 是绝对路径调用，需要单独处理
@@ -195,7 +195,7 @@ func installPlatformShims(projectPath: String) -> (dir: String, shims: [Platform
     cfolder(atPath: javaHomeDir)
     if let javaHome = shims.first(where: { $0.name == "java_home" }) {
         cfile(atPath: "\(javaHomeDir)/java_home", withContent: javaHome.script)
-        shell("chmod +x '\(javaHomeDir)/java_home'", uid: 501, env: [])
+        _ = shell("chmod +x '\(javaHomeDir)/java_home'", uid: 501, env: [])
     }
 
     return (dir, shims)

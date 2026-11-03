@@ -73,6 +73,67 @@ struct XcodeBuildConfig {
     var currentProjectVersion: String = ""        // CURRENT_PROJECT_VERSION
     var resourcesFolderPath: String = ""          // UNLOCALIZED_RESOURCES_FOLDER_PATH
     var sourceFound: Bool = false
+    var sourceRoot: String = ""                   // .xcodeproj 所在目录，即 Xcode 的 SRCROOT
+}
+
+// MARK: - 工程定位
+
+struct XcodeProjectLocation {
+    var sourceRoot: String      // 含 .xcodeproj 的目录（Xcode SRCROOT）
+    var projectBundle: String   // xxx.xcodeproj 的绝对路径
+}
+
+/// 在工程目录里寻找 .xcodeproj。
+///
+/// GitHub 导入的仓库经常把工程放在子目录里（Sources/App/App.xcodeproj），
+/// 只检查根目录会漏掉全部构建设置和脚本阶段，最后只能靠猜目录编译。
+/// 这里按广度优先搜索，优先使用层级最浅的工程。
+func discoverXcodeProject(projectPath: String) -> XcodeProjectLocation? {
+    let fm = FileManager.default
+    // 只去掉末尾斜杠；不能用 trimmingCharacters 去首尾斜杠，
+    // 否则 "/tmp/App" 会变成相对路径 "tmp/App"。
+    var root = (projectPath as NSString).standardizingPath
+    while root.count > 1 && root.hasSuffix("/") {
+        root.removeLast()
+    }
+    guard fm.fileExists(atPath: root) else { return nil }
+
+    // 这些目录里不会有可构建的 iOS 工程，搜进去只会白白拖慢导入
+    let skipped: Set<String> = [
+        ".git", ".github", "build", "Build", "Pods", "DerivedData",
+        "node_modules", ".fcm-cache", ".fcm-errors", ".fcm-java",
+        "java_runtimes", "Payload", "clang"
+    ]
+
+    var queue: [(String, Int)] = [(root, 0)]
+    var visited: Set<String> = []
+
+    while !queue.isEmpty {
+        let (directory, depth) = queue.removeFirst()
+        if visited.contains(directory) { continue }
+        visited.insert(directory)
+
+        let entries = (try? fm.contentsOfDirectory(atPath: directory))?.sorted() ?? []
+        for entry in entries where entry.hasSuffix(".xcodeproj") {
+            let bundle = "\(directory)/\(entry)"
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: bundle, isDirectory: &isDir), isDir.boolValue,
+               fm.fileExists(atPath: "\(bundle)/project.pbxproj") {
+                return XcodeProjectLocation(sourceRoot: directory, projectBundle: bundle)
+            }
+        }
+
+        guard depth < 4 else { continue }
+        for entry in entries {
+            if entry.hasPrefix(".") || skipped.contains(entry) { continue }
+            let child = "\(directory)/\(entry)"
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: child, isDirectory: &isDir), isDir.boolValue {
+                queue.append((child, depth + 1))
+            }
+        }
+    }
+    return nil
 }
 
 // MARK: - 解析
@@ -81,79 +142,80 @@ struct XcodeBuildConfig {
 func loadXcodeBuildConfig(projectPath: String) -> XcodeBuildConfig {
     var config = XcodeBuildConfig()
 
-    let fm = FileManager.default
-    guard let entries = try? fm.contentsOfDirectory(atPath: projectPath) else { return config }
-    guard let projDir = entries.first(where: { $0.hasSuffix(".xcodeproj") }) else { return config }
-
-    let pbxproj = "\(projectPath)/\(projDir)/project.pbxproj"
+    guard let location = discoverXcodeProject(projectPath: projectPath) else { return config }
+    // $(SRCROOT) 指向 .xcodeproj 所在目录，而不是仓库最外层。
+    // 嵌套工程下这两者不同，展开错了所有头文件路径都会失效。
+    let sourceRoot = location.sourceRoot
+    let pbxproj = "\(location.projectBundle)/project.pbxproj"
     guard let text = try? String(contentsOfFile: pbxproj, encoding: .utf8) else { return config }
     config.sourceFound = true
+    config.sourceRoot = sourceRoot
 
     // ---- HEADER_SEARCH_PATHS ----
-    config.headerSearchPaths = parseListSetting("HEADER_SEARCH_PATHS", in: text, projectPath: projectPath)
+    config.headerSearchPaths = parseListSetting("HEADER_SEARCH_PATHS", in: text, projectPath: sourceRoot)
 
     // ---- OTHER_LDFLAGS ----
-    config.otherLDFlags = parseListSetting("OTHER_LDFLAGS", in: text, projectPath: projectPath)
+    config.otherLDFlags = parseListSetting("OTHER_LDFLAGS", in: text, projectPath: sourceRoot)
 
     // ---- OTHER_CFLAGS ----
-    config.otherCFlags = parseListSetting("OTHER_CFLAGS", in: text, projectPath: projectPath)
+    config.otherCFlags = parseListSetting("OTHER_CFLAGS", in: text, projectPath: sourceRoot)
 
     // ---- GCC_PREPROCESSOR_DEFINITIONS ----
-    config.preprocessorDefinitions = parseListSetting("GCC_PREPROCESSOR_DEFINITIONS", in: text, projectPath: projectPath)
+    config.preprocessorDefinitions = parseListSetting("GCC_PREPROCESSOR_DEFINITIONS", in: text, projectPath: sourceRoot)
 
     // ---- LIBRARY_SEARCH_PATHS / FRAMEWORK_SEARCH_PATHS ----
-    config.librarySearchPaths = parseListSetting("LIBRARY_SEARCH_PATHS", in: text, projectPath: projectPath)
-    config.frameworkSearchPaths = parseListSetting("FRAMEWORK_SEARCH_PATHS", in: text, projectPath: projectPath)
+    config.librarySearchPaths = parseListSetting("LIBRARY_SEARCH_PATHS", in: text, projectPath: sourceRoot)
+    config.frameworkSearchPaths = parseListSetting("FRAMEWORK_SEARCH_PATHS", in: text, projectPath: sourceRoot)
 
     // ---- 布尔设置 ----
     config.enableObjCARC = parseBoolSetting("CLANG_ENABLE_OBJC_ARC", in: text, defaultValue: true)
     config.enableModules = parseBoolSetting("CLANG_ENABLE_MODULES", in: text, defaultValue: true)
 
     // ---- 字符串设置 ----
-    config.infoplistFile = parseStringSetting("INFOPLIST_FILE", in: text, projectPath: projectPath)
-    config.clanguageStandard = parseStringSetting("GCC_C_LANGUAGE_STANDARD", in: text, projectPath: projectPath)
-    config.optimizationLevel = parseStringSetting("GCC_OPTIMIZATION_LEVEL", in: text, projectPath: projectPath)
-    config.deadCodeStripping = parseStringSetting("DEAD_CODE_STRIPPING", in: text, projectPath: projectPath)
-    config.supportedPlatforms = parseStringSetting("SUPPORTED_PLATFORMS", in: text, projectPath: projectPath)
-    config.runpathSearchPaths = parseListSetting("LD_RUNPATH_SEARCH_PATHS", in: text, projectPath: projectPath)
+    config.infoplistFile = parseStringSetting("INFOPLIST_FILE", in: text, projectPath: sourceRoot)
+    config.clanguageStandard = parseStringSetting("GCC_C_LANGUAGE_STANDARD", in: text, projectPath: sourceRoot)
+    config.optimizationLevel = parseStringSetting("GCC_OPTIMIZATION_LEVEL", in: text, projectPath: sourceRoot)
+    config.deadCodeStripping = parseStringSetting("DEAD_CODE_STRIPPING", in: text, projectPath: sourceRoot)
+    config.supportedPlatforms = parseStringSetting("SUPPORTED_PLATFORMS", in: text, projectPath: sourceRoot)
+    config.runpathSearchPaths = parseListSetting("LD_RUNPATH_SEARCH_PATHS", in: text, projectPath: sourceRoot)
     config.strictObjCMsgSend = parseBoolSetting("ENABLE_STRICT_OBJC_MSGSEND", in: text, defaultValue: false)
     config.generateInfoPlist = parseBoolSetting("GENERATE_INFOPLIST_FILE", in: text, defaultValue: true)
 
-    config.userHeaderSearchPaths = parseListSetting("USER_HEADER_SEARCH_PATHS", in: text, projectPath: projectPath)
-    config.systemHeaderSearchPaths = parseListSetting("SYSTEM_HEADER_SEARCH_PATHS", in: text, projectPath: projectPath)
-    config.systemFrameworkSearchPaths = parseListSetting("SYSTEM_FRAMEWORK_SEARCH_PATHS", in: text, projectPath: projectPath)
-    config.cxxLanguageStandard = parseStringSetting("CLANG_CXX_LANGUAGE_STANDARD", in: text, projectPath: projectPath)
-    config.swiftOptimizationLevel = parseStringSetting("SWIFT_OPTIMIZATION_LEVEL", in: text, projectPath: projectPath)
-    config.swiftObjcBridgingHeader = parseStringSetting("SWIFT_OBJC_BRIDGING_HEADER", in: text, projectPath: projectPath)
-    config.swiftVersion = parseStringSetting("SWIFT_VERSION", in: text, projectPath: projectPath)
-    config.productName = parseStringSetting("PRODUCT_NAME", in: text, projectPath: projectPath)
-    config.executablePrefix = parseStringSetting("EXECUTABLE_PREFIX", in: text, projectPath: projectPath)
-    config.executableSuffix = parseStringSetting("EXECUTABLE_SUFFIX", in: text, projectPath: projectPath)
+    config.userHeaderSearchPaths = parseListSetting("USER_HEADER_SEARCH_PATHS", in: text, projectPath: sourceRoot)
+    config.systemHeaderSearchPaths = parseListSetting("SYSTEM_HEADER_SEARCH_PATHS", in: text, projectPath: sourceRoot)
+    config.systemFrameworkSearchPaths = parseListSetting("SYSTEM_FRAMEWORK_SEARCH_PATHS", in: text, projectPath: sourceRoot)
+    config.cxxLanguageStandard = parseStringSetting("CLANG_CXX_LANGUAGE_STANDARD", in: text, projectPath: sourceRoot)
+    config.swiftOptimizationLevel = parseStringSetting("SWIFT_OPTIMIZATION_LEVEL", in: text, projectPath: sourceRoot)
+    config.swiftObjcBridgingHeader = parseStringSetting("SWIFT_OBJC_BRIDGING_HEADER", in: text, projectPath: sourceRoot)
+    config.swiftVersion = parseStringSetting("SWIFT_VERSION", in: text, projectPath: sourceRoot)
+    config.productName = parseStringSetting("PRODUCT_NAME", in: text, projectPath: sourceRoot)
+    config.executablePrefix = parseStringSetting("EXECUTABLE_PREFIX", in: text, projectPath: sourceRoot)
+    config.executableSuffix = parseStringSetting("EXECUTABLE_SUFFIX", in: text, projectPath: sourceRoot)
     // ARCHS 既可能是单值，也可能写成数组 (arm64, arm64e)；
     // 数组形式用 parseStringSetting 会被括号/换行截断，必须按列表解析。
-    let archValues = parseListSetting("ARCHS", in: text, projectPath: projectPath)
+    let archValues = parseListSetting("ARCHS", in: text, projectPath: sourceRoot)
     config.architectures = archValues.isEmpty
-        ? parseStringSetting("ARCHS", in: text, projectPath: projectPath)
+        ? parseStringSetting("ARCHS", in: text, projectPath: sourceRoot)
         : archValues.joined(separator: " ")
-    let validArchValues = parseListSetting("VALID_ARCHS", in: text, projectPath: projectPath)
+    let validArchValues = parseListSetting("VALID_ARCHS", in: text, projectPath: sourceRoot)
     config.validArchs = validArchValues.isEmpty
-        ? parseStringSetting("VALID_ARCHS", in: text, projectPath: projectPath)
+        ? parseStringSetting("VALID_ARCHS", in: text, projectPath: sourceRoot)
         : validArchValues.joined(separator: " ")
     config.onlyActiveArch = parseBoolSetting("ONLY_ACTIVE_ARCH", in: text, defaultValue: false)
     config.stripInstalledProduct = parseBoolSetting("STRIP_INSTALLED_PRODUCT", in: text, defaultValue: false)
-    config.stripStyle = parseStringSetting("STRIP_STYLE", in: text, projectPath: projectPath)
-    config.debugInformationFormat = parseStringSetting("DEBUG_INFORMATION_FORMAT", in: text, projectPath: projectPath)
-    config.codeSignEntitlements = parseStringSetting("CODE_SIGN_ENTITLEMENTS", in: text, projectPath: projectPath)
-    let excludedValues = parseListSetting("EXCLUDED_ARCHITECTURES", in: text, projectPath: projectPath)
+    config.stripStyle = parseStringSetting("STRIP_STYLE", in: text, projectPath: sourceRoot)
+    config.debugInformationFormat = parseStringSetting("DEBUG_INFORMATION_FORMAT", in: text, projectPath: sourceRoot)
+    config.codeSignEntitlements = parseStringSetting("CODE_SIGN_ENTITLEMENTS", in: text, projectPath: sourceRoot)
+    let excludedValues = parseListSetting("EXCLUDED_ARCHITECTURES", in: text, projectPath: sourceRoot)
     config.excludedArchitectures = excludedValues.isEmpty
-        ? parseStringSetting("EXCLUDED_ARCHITECTURES", in: text, projectPath: projectPath)
+        ? parseStringSetting("EXCLUDED_ARCHITECTURES", in: text, projectPath: sourceRoot)
         : excludedValues.joined(separator: " ")
-    config.assetCatalogAppIcon = parseStringSetting("ASSETCATALOG_COMPILER_APPICON_NAME", in: text, projectPath: projectPath)
-    config.assetCatalogAccentColor = parseStringSetting("ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME", in: text, projectPath: projectPath)
-    config.marketingVersion = parseStringSetting("MARKETING_VERSION", in: text, projectPath: projectPath)
-    config.currentProjectVersion = parseStringSetting("CURRENT_PROJECT_VERSION", in: text, projectPath: projectPath)
-    config.productBundleIdentifier = parseStringSetting("PRODUCT_BUNDLE_IDENTIFIER", in: text, projectPath: projectPath)
-    config.deploymentTarget = parseStringSetting("IPHONEOS_DEPLOYMENT_TARGET", in: text, projectPath: projectPath)
+    config.assetCatalogAppIcon = parseStringSetting("ASSETCATALOG_COMPILER_APPICON_NAME", in: text, projectPath: sourceRoot)
+    config.assetCatalogAccentColor = parseStringSetting("ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME", in: text, projectPath: sourceRoot)
+    config.marketingVersion = parseStringSetting("MARKETING_VERSION", in: text, projectPath: sourceRoot)
+    config.currentProjectVersion = parseStringSetting("CURRENT_PROJECT_VERSION", in: text, projectPath: sourceRoot)
+    config.productBundleIdentifier = parseStringSetting("PRODUCT_BUNDLE_IDENTIFIER", in: text, projectPath: sourceRoot)
+    config.deploymentTarget = parseStringSetting("IPHONEOS_DEPLOYMENT_TARGET", in: text, projectPath: sourceRoot)
 
     return config
 }

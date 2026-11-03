@@ -140,23 +140,40 @@ func runBuildDiagnostics(projectPath: String) -> BuildDiagnosticsReport {
     }
 
     // ---- 5) Java 工程 ----
-    let javaAppDir = "\(projectPath)/JavaApp"
-    if fm.fileExists(atPath: javaAppDir) {
+    // 不能只看有没有 JavaApp 目录：Air2 这类工程把启动核心放在
+    // JavaApp/src/launcher、JavaApp/src/lwjgl 等多个源码集里。
+    let needsJavaBuild = projectNeedsJavaBuild(projectPath)
+    if needsJavaBuild {
         let java = detectJavaToolchain(projectPath: projectPath)
-        if java.ready {
+        if java.ready && java.supportsJava8Target {
             report.info("JDK：\(java.version)（\(java.source)）")
+            report.info("Java 目标：Java 8（major 52，\(java.java8Flags.joined(separator: " "))）")
+        } else if java.ready {
+            report.warn("JDK \(java.version) 不支持 Java 8 目标",
+                        hint: "FCM 需要产出 major 52 的 class；请导入 JDK 8（设置 > Java 环境）")
         } else {
             let jars = findPrebuiltJars(projectPath: projectPath)
-            if !jars.isEmpty {
-                report.info("没有 JDK，但已有 \(jars.count) 个预编译 jar，将跳过 Java 编译")
-            } else {
-                report.warn("工程有 JavaApp 但设备上没有 JDK",
-                            hint: "设置 > Java 环境 导入 JDK，或把编好的 jar 放到 JavaApp/build/")
-            }
+            report.warn("工程有 Java 源码，但设备上没有 JDK",
+                        hint: jars.isEmpty
+                            ? "设置 > Java 环境 导入 JDK 8；否则启动核心无法编译"
+                            : "设置 > Java 环境 导入 JDK 8；仅有 \(jars.count) 个预编译 jar 不足以重新编译源码")
+        }
+    } else {
+        let jars = findPrebuiltJars(projectPath: projectPath)
+        if !jars.isEmpty {
+            report.info("检测到 \(jars.count) 个预编译 jar，将直接参与打包")
         }
     }
 
     // ---- 6) CI 脚本依赖 ----
+    // GitHub CI 常把大体积运行时放在 release 资产里（Air2 的四档 JRE 即如此），
+    // 构建前会按 workflow 声明自动下载；这里提前告知，避免被长时间下载吓到。
+    let releaseAssets = missingReleaseAssets(projectPath: projectPath)
+    if !releaseAssets.isEmpty {
+        report.info("构建前将下载 \(releaseAssets.count) 个 release 资产："
+                    + releaseAssets.map { $0.asset }.joined(separator: "、"))
+    }
+
     let ciSteps = ciPrepSteps(for: projectPath)
     if !ciSteps.isEmpty {
         report.info("检测到 \(ciSteps.count) 个 CI 准备步骤")

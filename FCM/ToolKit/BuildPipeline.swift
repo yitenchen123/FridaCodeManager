@@ -181,6 +181,80 @@ func detectToolchain() -> ToolchainStatus {
     return status
 }
 
+// MARK: - Info.plist 构建变量
+
+/// 展开 Info.plist 里的 `$(PRODUCT_NAME)` / `$(EXECUTABLE_NAME)` 等构建变量。
+///
+/// Xcode 在拷贝 Info.plist 时会用构建设置替换这些占位符。
+/// GitHub 导入的工程普遍使用 `$(EXECUTABLE_NAME)`、`$(PRODUCT_BUNDLE_IDENTIFIER)`，
+/// 不展开的话 App 名会直接显示成字面量，甚至影响安装校验。
+/// 返回替换的键数量。
+func expandInfoPlistBuildVariables(at plistPath: String,
+                                   executableName: String,
+                                   finalExecutable: String,
+                                   bundleID: String,
+                                   config: XcodeBuildConfig) -> Int {
+    guard var plist = readPlistDictionary(at: plistPath) else { return 0 }
+
+    let currentVersion = config.currentProjectVersion.isEmpty
+        ? "1" : config.currentProjectVersion
+    let marketingVersion: String
+    if !config.marketingVersion.isEmpty {
+        marketingVersion = config.marketingVersion
+    } else {
+        marketingVersion = (plist["CFBundleShortVersionString"] as? String) ?? "1.0"
+    }
+    let developmentLanguage = (plist["CFBundleDevelopmentRegion"] as? String) ?? "en"
+
+    let replacements: [String: String] = [
+        "EXECUTABLE_NAME": finalExecutable,
+        "TARGET_NAME": executableName,
+        "PRODUCT_NAME": executableName,
+        "PRODUCT_MODULE_NAME": safeModuleName(executableName),
+        "PRODUCT_BUNDLE_IDENTIFIER": bundleID,
+        "CURRENT_PROJECT_VERSION": currentVersion,
+        "MARKETING_VERSION": marketingVersion,
+        "DEVELOPMENT_LANGUAGE": developmentLanguage,
+        "SRCROOT": config.sourceRoot
+    ]
+
+    var replaced = 0
+
+    func expandString(_ value: String) -> String {
+        var result = value
+        for (key, replacement) in replacements {
+            for token in ["$(" + key + ")", "${" + key + "}"] {
+                if result.contains(token) {
+                    replaced += result.components(separatedBy: token).count - 1
+                    result = result.replacingOccurrences(of: token, with: replacement)
+                }
+            }
+        }
+        return result
+    }
+
+    func walk(_ value: Any) -> Any {
+        if let string = value as? String {
+            return expandString(string)
+        }
+        if let dictionary = value as? [String: Any] {
+            var result: [String: Any] = [:]
+            for (key, child) in dictionary {
+                result[key] = walk(child)
+            }
+            return result
+        }
+        if let array = value as? [Any] {
+            return array.map { walk($0) }
+        }
+        return value
+    }
+
+    plist = walk(plist) as? [String: Any] ?? plist
+    guard writePlistDictionary(plist, to: plistPath) else { return 0 }
+    return replaced
+}
+
 // MARK: - 产物校验
 
 /// CPU 类型 → 架构名（Mach-O 头里的 cputype）

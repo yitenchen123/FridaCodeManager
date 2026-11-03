@@ -219,6 +219,25 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         }
     }
 
+    // ---------------- Release 资产 ----------------
+    // GitHub CI 把大体积运行时（如 Air2 的四档 JRE）放在 release 资产里，
+    // 构建前下载解压。缺了它们，产物能安装但启动缺运行时。
+    let releaseAssets = missingReleaseAssets(projectPath: ProjectInfo.ProjectPath)
+    if !releaseAssets.isEmpty {
+        messenger(status, progress, "准备运行时资源", 0.08)
+        _ = climessenger("release-assets",
+                         "检测到 \(releaseAssets.count) 个 release 资产："
+                         + releaseAssets.map { $0.asset }.joined(separator: "、"))
+        let staged = stageReleaseAssets(projectPath: ProjectInfo.ProjectPath) { line in
+            _ = climessenger("release-assets", line)
+        }
+        if !staged {
+            _ = climessenger("release-assets-hint",
+                             "release 资产未就位，产物会缺运行时；请确认网络后重试")
+            return 1
+        }
+    }
+
     //finding code files
     messenger(status,progress,"finding code files",0.1)
     // 内置忽略项 + api.api 的忽略项；避免把 Payload/clang/build 里的旧副本也编进去
@@ -256,6 +275,8 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     // Xcode 用 HEADER_SEARCH_PATHS / OTHER_LDFLAGS 精确控制编译，
     // 靠扫描目录猜测必然对不上，这是之前链路反复失败的根因。
     let xcodeConfig = loadXcodeBuildConfig(projectPath: ProjectInfo.ProjectPath)
+    // .xcodeproj 可能在子目录里（GitHub 仓库很常见），SRCROOT 必须指向它所在的目录
+    let xcodeRoot = xcodeConfig.sourceRoot.isEmpty ? ProjectInfo.ProjectPath : xcodeConfig.sourceRoot
     var headerFlags = ""
     // swiftc 的 Clang importer 需要同一组路径，但必须经 -Xcc 转发
     var swiftHeaderFlags = ""
@@ -287,7 +308,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         _ = climessenger("xcode-config", "未找到 .xcodeproj 配置，改用目录扫描")
     }
     // bridging header 经常 import 工程根目录里的头文件，根目录始终加入 importer 搜索路径
-    swiftHeaderFlags += " -Xcc -I" + shellQuote(ProjectInfo.ProjectPath)
+    swiftHeaderFlags += " -Xcc -I" + shellQuote(xcodeRoot)
 
     // Header Map（对应 Xcode 的 USE_HEADERMAP = YES，默认开启）
     //
@@ -348,7 +369,11 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     // 旧实现同时传 -arch x86_64 和 -target arm64-apple-ios，两者会直接冲突。
     let targetArchs = resolveTargetArchitectures(from: xcodeConfig)
     let targetArch = targetArchs.first(where: { $0 == "arm64" }) ?? targetArchs[0]
-    let targetTriple = "\(targetArch)-apple-ios\(ProjectInfo.TG)"
+    // 部署版本优先用工程里的 IPHONEOS_DEPLOYMENT_TARGET（Air2 是 14.0）。
+    // 用设备当前系统版本当部署目标，会把只在更高系统存在的 API 编进来。
+    let deploymentTarget = xcodeConfig.deploymentTarget.isEmpty
+        ? ProjectInfo.TG : xcodeConfig.deploymentTarget
+    let targetTriple = "\(targetArch)-apple-ios\(deploymentTarget)"
     if targetArchs != ["arm64"] {
         _ = climessenger("xcode-config", "目标架构：" + targetArchs.joined(separator: ", ") + "，使用 " + targetArch)
     }
@@ -420,7 +445,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     // 桥接头：工程设置优先，其次工程根目录的 bridge.h
     var bridgingHeader = ""
     let configuredBridge = resolveProjectFilePath(xcodeConfig.swiftObjcBridgingHeader,
-                                                  projectPath: ProjectInfo.ProjectPath)
+                                                  projectPath: xcodeRoot)
     if !configuredBridge.isEmpty, FileManager.default.fileExists(atPath: configuredBridge) {
         bridgingHeader = configuredBridge
     } else if FileManager.default.fileExists(atPath: info[5]) {
@@ -690,15 +715,27 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     // 同时补齐 Info.plist 必需键并生成 PkgInfo，尽量贴近 Xcode 的产出结构。
     // 链接产物已经写在 stagingApp 内，这里不能再次删除它。
     let configuredInfoPlist = resolveProjectFilePath(xcodeConfig.infoplistFile,
-                                                     projectPath: ProjectInfo.ProjectPath)
+                                                     projectPath: xcodeRoot)
     let resourceReport = compileResources(from: info[2],
                                           into: stagingApp,
                                           projectName: ProjectInfo.Executable,
                                           executable: finalExecutable,
                                           sdkPath: info[3],
-                                          minimumOS: ProjectInfo.TG,
+                                          minimumOS: deploymentTarget,
                                           infoPlistSource: configuredInfoPlist,
                                           appIconName: xcodeConfig.assetCatalogAppIcon)
+
+    // Info.plist 里的 $(PRODUCT_NAME) / $(EXECUTABLE_NAME) / $(CURRENT_PROJECT_VERSION)
+    // 必须像 Xcode 一样展开，否则 Air2 这类工程的 CFBundleName 会保留字面量。
+    let expandedKeys = expandInfoPlistBuildVariables(
+        at: "\(stagingApp)/Info.plist",
+        executableName: executableName,
+        finalExecutable: finalExecutable,
+        bundleID: ProjectInfo.BundleID,
+        config: xcodeConfig)
+    if expandedKeys > 0 {
+        _ = climessenger("bundle-stage", "已展开 Info.plist 构建变量 \(expandedKeys) 处")
+    }
 
     // 保证 bundle id 与工程记录一致（Info.plist 缺失时 fillInfoPlist 不一定有该键）
     _ = wplist(value: ProjectInfo.BundleID,
@@ -745,6 +782,34 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         return 1
     }
 
+    // ---------------- Java 启动核心 ----------------
+    // Air2 / Pojav 系工程的 Java 侧是 App 真正启动 Minecraft 的入口。
+    // 它们原本靠工程 Makefile 在宿主 Mac 上编译；设备没有 make/python，
+    // 脚本阶段必然掉进坑里。这里直接用 javac/jar 产出 Java 8 字节码，
+    // 再放进 .app/Java/，不再依赖工程脚本环境。
+    var javaAlreadyBuilt = false
+    if projectNeedsJavaBuild(ProjectInfo.ProjectPath) {
+        messenger(status, progress, "编译 Java 核心", 0.49)
+        _ = climessenger("java-stage", "检测到 Java 源码，开始按 Java 8（major 52）编译")
+        let javaOutcome = buildJavaProject(projectPath: ProjectInfo.ProjectPath,
+                                           appPath: stagingApp) { line in
+            _ = climessenger("java-stage", line)
+        }
+        if javaOutcome.ok {
+            javaAlreadyBuilt = true
+            for note in javaOutcome.notes {
+                _ = climessenger("java-stage", "  · " + note)
+            }
+        } else {
+            for line in javaOutcome.failure.split(separator: "\n") {
+                _ = climessenger("java-stage", String(line))
+            }
+            _ = climessenger("java-hint", "Java 核心是启动必需产物；缺 JDK 时请先在「设置 > Java 环境」导入 JDK 8")
+            _ = rm(info[0])
+            return 1
+        }
+    }
+
     // ---------------- 脚本阶段 ----------------
     // Xcode 的顺序：编译 → 链接 → 拷资源 → 脚本阶段 → 签名。
     // 很多 GitHub 项目把依赖下载、资源拷贝放在这里，
@@ -757,7 +822,9 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
                                                   projectPath: ProjectInfo.ProjectPath,
                                                   appPath: stagingApp,
                                                   configuration: erase ? "Release" : "Debug",
-                                                  sdkPath: info[3]) { line in
+                                                  sdkPath: info[3],
+                                                  sourceRoot: xcodeRoot,
+                                                  javaAlreadyBuilt: javaAlreadyBuilt) { line in
             _ = climessenger("shell-phase", line)
         }
         if !phasesSucceeded {
@@ -805,7 +872,7 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     // CODE_SIGN_ENTITLEMENTS 优先于工程根目录的 entitlements.plist
     var entitlementsPath = info[6]
     let configuredEntitlements = resolveProjectFilePath(xcodeConfig.codeSignEntitlements,
-                                                        projectPath: ProjectInfo.ProjectPath)
+                                                        projectPath: xcodeRoot)
     if !configuredEntitlements.isEmpty,
        FileManager.default.fileExists(atPath: configuredEntitlements) {
         entitlementsPath = configuredEntitlements

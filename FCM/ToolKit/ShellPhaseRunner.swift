@@ -42,11 +42,9 @@ struct ShellBuildPhase {
 
 /// 从 project.pbxproj 里提取所有 PBXShellScriptBuildPhase
 func loadShellBuildPhases(projectPath: String) -> [ShellBuildPhase] {
-    let fm = FileManager.default
-    guard let entries = try? fm.contentsOfDirectory(atPath: projectPath) else { return [] }
-    guard let projDir = entries.first(where: { $0.hasSuffix(".xcodeproj") }) else { return [] }
-
-    let pbxproj = "\(projectPath)/\(projDir)/project.pbxproj"
+    // 与 loadXcodeBuildConfig 使用同一套定位逻辑：嵌套工程也要找得到脚本阶段。
+    guard let location = discoverXcodeProject(projectPath: projectPath) else { return [] }
+    let pbxproj = "\(location.projectBundle)/project.pbxproj"
     guard let text = try? String(contentsOfFile: pbxproj, encoding: .utf8) else { return [] }
 
     var phases: [ShellBuildPhase] = []
@@ -141,10 +139,14 @@ func findPrebuiltJars(projectPath: String) -> [String] {
     let fm = FileManager.default
     var found: [String] = []
 
+    // 只统计「工程自己编译出来的」jar。
+    // 以前把 Libraries/Jars 也算进来，Air2 仓库里自带的 lwjgl 库会被误判成
+    // “启动核心已经编好”，于是在没有 JDK 时静默跳过 Java 阶段，产物缺 jar。
     let searchDirs = [
         "\(projectPath)/JavaApp/build",
+        "\(projectPath)/JavaApp/java",
+        "\(projectPath)/build/java",
         "\(projectPath)/build",
-        "\(projectPath)/Libraries/Jars",
         "\(projectPath)/java"
     ]
     for dir in searchDirs {
@@ -156,6 +158,21 @@ func findPrebuiltJars(projectPath: String) -> [String] {
     return found.sorted()
 }
 
+/// 判断一个脚本阶段是否在“编译 Java”。
+///
+/// 不能只看脚本里有没有 make：Air2 的 Stage Runtime Bundle 也会 cp jar，
+/// 但它是拷运行时资源，跳过就会缺 JRE / 渲染库。
+private func isJavaCompilePhase(_ phase: ShellBuildPhase) -> Bool {
+    let text = (phase.name + "\n" + phase.script).lowercased()
+    if text.contains("javac") || text.contains("javaapp/makefile") || text.contains("gradle") {
+        return true
+    }
+    if text.contains("make") && (text.contains(".jar") || text.contains("javaapp")) {
+        return true
+    }
+    return false
+}
+
 /// 按顺序执行脚本阶段，返回是否全部成功
 /// 环境变量尽量对齐 Xcode 的注入，脚本里用 ${SRCROOT} 之类才不会失效
 func runShellBuildPhases(_ phases: [ShellBuildPhase],
@@ -163,8 +180,15 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
                          appPath: String,
                          configuration: String,
                          sdkPath: String = "",
+                         sourceRoot: String = "",
+                         javaAlreadyBuilt: Bool = false,
                          log: (String) -> Void) -> Bool {
     guard !phases.isEmpty else { return true }
+
+    // SRCROOT 是 .xcodeproj 所在目录；嵌套工程不能回退到仓库根目录。
+    let xcodeRoot = sourceRoot.isEmpty
+        ? (discoverXcodeProject(projectPath: projectPath)?.sourceRoot ?? projectPath)
+        : sourceRoot
 
     let buildDir = "\(global_container)/tmp/fcm-build-dir"
     cfolder(atPath: buildDir)
@@ -177,12 +201,11 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
     // 工程脚本里常写 cp xxx "$BUILT_PRODUCTS_DIR/$TARGET_NAME.app/Java/"，
     // 如果 Java/ 不存在，cp 会直接失败。
     // Xcode 在拷贝资源阶段会建好这些目录，FCM 也要提前准备。
+    let appName = appPath.isEmpty ? "" : (appPath as NSString).lastPathComponent
     if !appPath.isEmpty {
-        let appName = (appPath as NSString).lastPathComponent
         for sub in ["Java", "libs", "java_runtimes", "Frameworks", "Resources"] {
             cfolder(atPath: "\(appPath)/\(sub)")
         }
-        _ = appName
     }
 
     // 探测 JDK：很多工程（如 Air2）的 Makefile 用 BOOTJDK 指定编译器，
@@ -191,20 +214,19 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
     let javaToolchainReady = java.ready
     let javaReport = describeJavaToolchain(java)
     for line in javaReport.split(separator: "\n") {
-        log("  JDK：" + line)
+        log("  " + line)
     }
 
     // 安装 macOS 工具模拟层：java_home / actool / xcodebuild / codesign 等
     // 没有这层，工程脚本里的 macOS 专属命令会让 set -e 直接中止构建。
-    let shimInstall = installPlatformShims(projectPath: projectPath)
+    let shimInstall = installPlatformShims(projectPath: xcodeRoot)
     for shim in shimInstall.shims {
         log("  兼容处理：\(shim.note)")
     }
 
     // 检查 Java 产物是否已存在。
-    // iOS 上没有官方 JDK，javac 无法在设备上运行 —— 这是硬限制。
-    // 但如果 jar 已经提前准备好（从 Mac 拷进来 / 从 CI 下载 / 已提交进仓库），
-    // 就不需要再编译，直接跳过 Java 阶段。
+    // 如果 jar 已经提前准备好（从 Mac 拷进来 / 从 CI 下载 / 已提交进仓库），
+    // 而且设备上没有 JDK，就不需要再跑工程里的 Java 编译阶段。
     let existingJars = findPrebuiltJars(projectPath: projectPath)
     let canSkipJavaBuild = !existingJars.isEmpty
 
@@ -218,10 +240,15 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
             log("  注意：\(warning)")
         }
 
+        // FCM 已经用 javac 编出了启动核心：跳过工程里重复的 Java 编译阶段，
+        // 避免 make / python / gradle 在设备上不可用而导致整个阶段失败。
+        if javaAlreadyBuilt && isJavaCompilePhase(phase) {
+            log("  FCM 已编译 Java 核心，跳过重复的 Java 编译")
+            continue
+        }
+
         // 已有 jar 时跳过 Java 编译阶段
-        let phaseLower = (phase.name + phase.script).lowercased()
-        let isJavaBuildPhase = phaseLower.contains("javaapp") || phaseLower.contains("javac")
-            || phaseLower.contains("gradle") || phaseLower.contains("make")
+        let isJavaBuildPhase = isJavaCompilePhase(phase)
         if isJavaBuildPhase && canSkipJavaBuild && javaToolchainReady == false {
             log("  已有预编译 jar，跳过此阶段")
             for jar in existingJars.prefix(5) {
@@ -238,9 +265,9 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
         // 注入 Xcode 风格的表头，让 ${SRCROOT} 之类的变量可用。
         // 值统一走 shellQuote：工程路径 / JDK 路径里出现空格或引号时不会截断脚本。
         var body = "#!/bin/sh\nset +e\n"
-        body += "export SRCROOT=\(shellQuote(projectPath))\n"
-        body += "export PROJECT_DIR=\(shellQuote(projectPath))\n"
-        body += "export PROJECT_FILE_PATH=\(shellQuote(projectPath))\n"
+        body += "export SRCROOT=\(shellQuote(xcodeRoot))\n"
+        body += "export PROJECT_DIR=\(shellQuote(xcodeRoot))\n"
+        body += "export PROJECT_FILE_PATH=\(shellQuote(xcodeRoot))\n"
         body += "export BUILD_DIR=\(shellQuote(buildDir))\n"
         body += "export BUILT_PRODUCTS_DIR=\(shellQuote(productsDir))\n"
         body += "export TARGET_BUILD_DIR=\(shellQuote(targetBuildDir))\n"
@@ -251,10 +278,15 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
         if !sdkPath.isEmpty {
             body += "export SDKROOT=\(shellQuote(sdkPath))\n"
         }
-        let targetName = (appPath as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: "")
+        let targetName = appName.replacingOccurrences(of: ".app", with: "")
         body += "export TARGET_NAME=\(shellQuote(targetName))\n"
         body += "export EXECUTABLE_NAME=\(shellQuote(targetName))\n"
         body += "export PRODUCT_NAME=\(shellQuote(targetName))\n"
+        // Air2 的 Stage Runtime Bundle 用 $CONTENTS_FOLDER_PATH 定位 .app。
+        // 不导出这个变量时，脚本会 cp 到 Payload/ 而不是 Payload/Air2.app/。
+        body += "export WRAPPER_NAME=\(shellQuote(appName))\n"
+        body += "export FULL_PRODUCT_NAME=\(shellQuote(appName))\n"
+        body += "export CONTENTS_FOLDER_PATH=\(shellQuote(appName))\n"
 
         // 把探测到的 JDK 传给脚本：Makefile 里的 BOOTJDK 与 JAVA_HOME 都会生效
         if let home = java.home, java.ready {
@@ -266,10 +298,10 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
         // shim 目录放最前，让 java_home / actool / codesign 等落到我们的实现。
         // 注意路径要跟随 jbroot，roothide 下不是 /var/jb。
         body += "export PATH=\"\(shimInstall.dir):\(jbroot)/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH\"\n"
-        body += "cd \(shellQuote(projectPath))\n"
+        body += "cd \(shellQuote(xcodeRoot))\n"
 
         // 软化脚本：替换 macOS 专属路径、降级 set -e、限制 Gradle 内存
-        let softened = softenShellScript(phase.script, projectPath: projectPath)
+        let softened = softenShellScript(phase.script, projectPath: xcodeRoot)
         if !softened.notes.isEmpty {
             for note in softened.notes {
                 log("  已处理：\(note)")
@@ -281,7 +313,7 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
         body += "\n"
 
         cfile(atPath: scriptFile, withContent: body)
-        shell("chmod +x " + shellQuote(scriptFile), uid: 501, env: [])
+        _ = shell("chmod +x " + shellQuote(scriptFile), uid: 501, env: [])
 
         let result = runCaptured(shellQuote(scriptFile), uid: 501)
         _ = rm(scriptFile)
@@ -299,20 +331,20 @@ func runShellBuildPhases(_ phases: [ShellBuildPhase],
                 log(trimmed)
             }
             // 判断这一步是否只影响 Java 侧。
-            // Air2 就是这样：Java 段需要 JDK 才能产出三个 jar，
-            // 但 ObjC/原生部分完全不依赖它。Java 失败不该让原生构建失败。
-            let lower = (phase.name + phase.script).lowercased()
-            let looksJavaOnly = lower.contains("javaapp") || lower.contains("javac")
-                || lower.contains("gradle") || lower.contains("jdk") || lower.contains(".jar")
-            if looksJavaOnly {
+            // 只对“编译 Java”的阶段降级。
+            // Stage Runtime Bundle 这类阶段也会拷贝 .jar，但它负责运行时资源，
+            // 失败就必须阻断，否则产物缺库却仍被当成成功。
+            let looksJavaOnly = isJavaCompilePhase(phase)
+                || phase.name.lowercased().contains("java")
+            if looksJavaOnly && javaAlreadyBuilt == false {
                 // Java 阶段失败只降级，不标记整体失败：
                 // 原生部分能编过就应该产出可运行的 ipa（只是缺 Java 功能）
                 log("  这是 Java 相关阶段，失败不阻断原生编译")
                 log("  影响：App.app/Java/ 下会缺 jar，App 启动时可能崩溃")
-                log("  解决：给设备装 JDK（apt install openjdk-17）后重新构建")
+                log("  解决：在「设置 > Java 环境」导入 JDK 8 后重新构建")
             } else {
                 allSucceeded = false
-                log("  已跳过，继续后续阶段")
+                log("  该阶段不可省略，构建将中止")
             }
         }
     }

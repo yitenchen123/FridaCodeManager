@@ -48,8 +48,48 @@ private let kIgnoredNames: Set<String> = [
 
 private let kSourceExtensions: Set<String> = [
     "swift", "m", "mm", "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx",
-    "s", "metal", "storyboard", "xib", "plist", "api", "xcconfig", "entitlements"
+    "s", "metal", "storyboard", "xib", "plist", "api", "xcconfig", "entitlements",
+    // 有些 GitHub 仓库的原生侧很少，核心逻辑全在 Java（如 Air2 / Pojav 系）
+    "java", "kt", "kts", "gradle", "cmake", "mk"
 ]
+
+/// 识别 GitHub 仓库使用的构建系统，用于导入后的提示与构建路径选择。
+private func detectProjectBuildSystems(_ directory: String) -> [String] {
+    let fm = FileManager.default
+    var systems: [String] = []
+
+    if let location = discoverXcodeProject(projectPath: directory) {
+        let name = (location.projectBundle as NSString).lastPathComponent
+        systems.append("Xcode 工程 \(name)")
+    }
+    if fm.fileExists(atPath: "\(directory)/Package.swift") {
+        systems.append("Swift Package")
+    }
+    if fm.fileExists(atPath: "\(directory)/Podfile") {
+        systems.append("CocoaPods")
+    }
+    if projectNeedsJavaBuild(directory) {
+        systems.append("Java 启动核心")
+    }
+    if fm.fileExists(atPath: "\(directory)/CMakeLists.txt") {
+        systems.append("CMake")
+    } else if let enumerator = fm.enumerator(atPath: directory) {
+        // 嵌套的 CMake 工程也很常见（Natives/CMakeLists.txt）
+        var visited = 0
+        for case let relative as String in enumerator {
+            visited += 1
+            if visited > 400 { break }
+            if relative.hasSuffix("CMakeLists.txt") {
+                systems.append("CMake（\(relative)）")
+                break
+            }
+        }
+    }
+    if fm.fileExists(atPath: "\(directory)/Makefile") {
+        systems.append("Makefile")
+    }
+    return systems
+}
 
 /// 系统自带的 zip 工具（越狱设备一定有，TrollStore 设备由系统 dyld 提供 libarchive）
 private enum ZipBackend {
@@ -326,8 +366,10 @@ private func wrapSourcesAsProject(_ directory: String, name: String) -> String? 
 /// 普通源码包：根据结构决定是「造工程外壳」还是「直接放进当前目录」
 private func adoptSourceDirectory(_ source: String, fallbackName: String?) -> ImportOutcome {
     let scan = scanSources(in: source)
-    if scan.files == 0 {
-        return .fail("压缩包里没有可识别的源码文件")
+    let systems = detectProjectBuildSystems(source)
+    // 纯预编译仓库（只有 .a/.dylib + xcodeproj）也应该允许导入
+    if scan.files == 0 && systems.isEmpty {
+        return .fail("压缩包里没有可识别的源码文件，也没有 Xcode / CMake / Makefile 工程")
     }
 
     let name = fallbackName ?? ((source as NSString).lastPathComponent)
@@ -342,7 +384,23 @@ private func adoptSourceDirectory(_ source: String, fallbackName: String?) -> Im
         guard let projectPath = wrapped else {
             return .fail("创建工程外壳失败")
         }
-        return .success("已导入工程「\(name)」", projectPath)
+        var message = "已导入工程「\(name)」"
+        if !systems.isEmpty {
+            message += "（\(systems.joined(separator: " · "))）"
+        }
+        // 这些依赖只能在 macOS 上准备，提前说清楚，避免构建到一半才报错
+        if systems.contains("CocoaPods") {
+            message += "\n注意：工程使用 CocoaPods。设备上无法执行 pod install，"
+                + "请先在 Mac 上安装依赖并提交 Pods/ 目录。"
+        }
+        if systems.contains("Swift Package") {
+            message += "\n注意：工程使用 Swift Package Manager。设备上无法解析远程依赖，"
+                + "请先在 Mac 上执行 swift package resolve 并提交 .build/ 或改用 Xcode 工程。"
+        }
+        if FileManager.default.fileExists(atPath: "\(source)/.gitmodules") {
+            message += "\n注意：仓库含 git 子模块；请确认导入时已完整拉取 submodule。"
+        }
+        return .success(message, projectPath)
     }
     return .success("已导入 \(scan.files) 个源码文件", nil)
 }
@@ -443,7 +501,7 @@ private func installProject(from root: String) -> ImportOutcome {
 }
 
 /// 把一个已经解压好的暂存目录收编为工程
-func adoptStagedDirectory(_ staging: String) -> ImportOutcome {
+func adoptStagedDirectory(_ staging: String, fallbackName: String? = nil) -> ImportOutcome {
     let fm = FileManager.default
 
     // 1) 已经是 FCM 工程（含 Resources/DontTouchMe.plist），允许外面多套几层
@@ -477,7 +535,7 @@ func adoptStagedDirectory(_ staging: String) -> ImportOutcome {
         displayName = cleanRepoName((sub as NSString).lastPathComponent)
     }
 
-    return adoptSourceDirectory(source, fallbackName: displayName)
+    return adoptSourceDirectory(source, fallbackName: displayName ?? fallbackName)
 }
 
 /// 把 zip 内容导入到某个目录内（工程里「导入」按钮用）
