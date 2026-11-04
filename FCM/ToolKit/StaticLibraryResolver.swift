@@ -171,14 +171,23 @@ private func archiveMemberPlatform(_ path: String) -> String? {
 ///   3. 架构无法判断时，按路径规则保留（避免误删）
 func collectIOSStaticLibraries(projectPath: String, ignorePrefixes: [String]) -> [String] {
     let fm = FileManager.default
-    guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else { return [] }
+    // 流式遍历：工程里带 JRE / Pods 时，subpathsOfDirectory 会一次性
+    // 把几万个路径装进数组，2GB 设备上很容易被系统杀掉。
+    guard let enumerator = fm.enumerator(atPath: projectPath) else { return [] }
 
     let ignoreList = makeBuildIgnoreList("") + ignorePrefixes
     var result: [String] = []
 
-    for file in all where file.hasSuffix(".a") {
+    for case let file as String in enumerator {
         // 用户配置的忽略项 + 构建产物目录
-        if isPathIgnored(file, prefixes: ignoreList) { continue }
+        if isPathIgnored(file, prefixes: ignoreList) {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: "\(projectPath)/\(file)", isDirectory: &isDir), isDir.boolValue {
+                enumerator.skipDescendants()
+            }
+            continue
+        }
+        guard file.hasSuffix(".a") else { continue }
 
         // 路径明显属于其他平台
         if pathHasForeignPlatform(file) { continue }
@@ -230,16 +239,26 @@ func machoPlatformOnly(_ path: String) -> String? {
 ///       libterracotta.a        ← 排除
 func collectIOSStaticFromXCFrameworks(projectPath: String, ignorePrefixes: [String]) -> [String] {
     let fm = FileManager.default
-    guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else { return [] }
+    guard let enumerator = fm.enumerator(atPath: projectPath) else { return [] }
     let ignoreList = makeBuildIgnoreList("") + ignorePrefixes
 
     var result: [String] = []
-    for entry in all where entry.hasSuffix(".xcframework") {
-        if isPathIgnored(entry, prefixes: ignoreList) { continue }
+    for case let entry as String in enumerator {
+        if isPathIgnored(entry, prefixes: ignoreList) {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: "\(projectPath)/\(entry)", isDirectory: &isDir), isDir.boolValue {
+                enumerator.skipDescendants()
+            }
+            continue
+        }
+        guard entry.hasSuffix(".xcframework") else { continue }
 
         let xcfPath = "\(projectPath)/\(entry)"
         var isDir: ObjCBool = false
         guard fm.fileExists(atPath: xcfPath, isDirectory: &isDir), isDir.boolValue else { continue }
+
+        // 内部结构由下面手动遍历，不必再让 enumerator 往里走
+        enumerator.skipDescendants()
 
         // 枚举里层 slice 目录
         guard let slices = try? fm.contentsOfDirectory(atPath: xcfPath) else { continue }
@@ -269,14 +288,21 @@ func collectIOSStaticFromXCFrameworks(projectPath: String, ignorePrefixes: [Stri
 /// 收集可用的 .framework 及其二进制路径（只收 arm64 的）
 func collectIOSFrameworks(projectPath: String, ignorePrefixes: [String]) -> [(name: String, path: String)] {
     let fm = FileManager.default
-    guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else { return [] }
+    guard let enumerator = fm.enumerator(atPath: projectPath) else { return [] }
     let ignoreList = makeBuildIgnoreList("") + ignorePrefixes
 
     var seen = Set<String>()
     var result: [(String, String)] = []
 
-    for entry in all where entry.hasSuffix(".framework") {
-        if isPathIgnored(entry, prefixes: ignoreList) { continue }
+    for case let entry as String in enumerator {
+        if isPathIgnored(entry, prefixes: ignoreList) {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: "\(projectPath)/\(entry)", isDirectory: &isDir), isDir.boolValue {
+                enumerator.skipDescendants()
+            }
+            continue
+        }
+        guard entry.hasSuffix(".framework") else { continue }
         if pathHasForeignPlatform(entry) { continue }
 
         let frameworkPath = "\(projectPath)/\(entry)"

@@ -70,27 +70,36 @@ func OpenApp(_ bundleID: String) -> Void {
 }
 #endif
 
+/// 扫描工程里的源文件（返回相对路径）。
+/// 用 enumerator 逐层遍历并在忽略目录处剪枝：
+/// subpathsOfDirectory 会把整棵树（含解压后的 JRE、Pods）一次性装进数组，
+/// 在 iPhone 7/8 这类 2GB 设备上很容易触发内存压力。
 func FindFilesStack(_ projectPath: String, _ fileExtensions: [String], _ ignore: [String]) -> [String] {
-    do {
-        let (fileExtensionsSet, allFiles) = (Set(fileExtensions), try FileManager.default.subpathsOfDirectory(atPath: projectPath))
+    let fm = FileManager.default
+    guard let enumerator = fm.enumerator(atPath: projectPath) else { return [] }
 
-        var objCFiles: [String] = []
+    let extensions = Set(fileExtensions)
+    var files: [String] = []
 
-        for file in allFiles {
-            // 注意：ignore 里可能出现空字符串（splitAndTrim("") 会返回 [""]），
-            // 而 hasPrefix("") 恒为 true —— 那会把所有文件都过滤掉，
-            // 表现为"编译瞬间完成，一个文件都没编"。
-            // 统一走 isPathIgnored，按目录边界匹配，避免 "build" 误伤 "builder.m"。
-            let ignored = isPathIgnored(file, prefixes: ignore)
-            if fileExtensionsSet.contains(where: { file.hasSuffix($0) }) && !ignored {
-                // 这里只返回相对路径，引号统一在拼接命令时加，
-                // 否则会出现 /工程路径/'相对路径' 这种把引号包在中间的写法，
-                // clang 会把 '文件名' 当成目录名，导致编译中断。
-                objCFiles.append(file)
+    for case let relative as String in enumerator {
+        // 注意：ignore 里可能出现空字符串（splitAndTrim("") 会返回 [""]），
+        // 而 hasPrefix("") 恒为 true —— 那会把所有文件都过滤掉，
+        // 表现为"编译瞬间完成，一个文件都没编"。
+        // 统一走 isPathIgnored，按目录边界匹配，避免 "build" 误伤 "builder.m"。
+        if isPathIgnored(relative, prefixes: ignore) {
+            var isDirectory: ObjCBool = false
+            if fm.fileExists(atPath: "\(projectPath)/\(relative)", isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                enumerator.skipDescendants()
             }
+            continue
         }
-        return objCFiles
-    } catch {
-        return []
+        if extensions.contains(where: { relative.hasSuffix($0) }) {
+            // 这里只返回相对路径，引号统一在拼接命令时加，
+            // 否则会出现 /工程路径/'相对路径' 这种把引号包在中间的写法，
+            // clang 会把 '文件名' 当成目录名，导致编译中断。
+            files.append(relative)
+        }
     }
+    return files
 }

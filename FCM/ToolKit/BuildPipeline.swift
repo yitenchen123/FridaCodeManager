@@ -32,7 +32,10 @@ import Foundation
 /// 或者“明明没改代码却重新编译了一堆文件”。
 let buildIgnoredDirectories: [String] = [
     ".git", "build", "Build", "Payload", "clang", ".fcm-cache", ".fcm-errors",
-    "node_modules", "DerivedData", "Pods", ".build", "Resources"
+    "node_modules", "DerivedData", "Pods", ".build", "Resources",
+    // 内嵌 JRE 与 Java 构建中间产物：解压后有上万个文件，
+    // 扫描源码时必须整棵跳过，否则 2GB 设备光遍历就要好几秒。
+    "java_runtimes", ".fcm-java", ".fcm-jdk"
 ]
 
 /// 把 api.api 里的用户在忽略项与内置忽略项合并

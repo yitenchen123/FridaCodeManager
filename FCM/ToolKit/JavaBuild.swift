@@ -58,14 +58,19 @@ private let javaIgnoredDirectories: [String] = [
 
 /// 工程里是否存在需要编译的 Java 源码。
 /// 只认真正的 .java，不把内嵌 JRE 自带的东西算进来。
+/// 用 enumerator 逐层遍历并在命中后立刻返回：Air2 解压 JRE 后有上万个文件，
+/// subpathsOfDirectory 会把它们全部装进数组，低内存设备上没必要。
 func projectNeedsJavaBuild(_ projectPath: String) -> Bool {
     let fm = FileManager.default
-    guard let subpaths = try? fm.subpathsOfDirectory(atPath: projectPath) else { return false }
+    guard let enumerator = fm.enumerator(atPath: projectPath) else { return false }
 
-    for relative in subpaths where relative.hasSuffix(".java") {
-        if isPathIgnored(relative, prefixes: javaIgnoredDirectories) { continue }
+    for case let relative as String in enumerator {
+        if isPathIgnored(relative, prefixes: javaIgnoredDirectories) {
+            enumerator.skipDescendants()
+            continue
+        }
         if isJavaRuntimePath(relative) { continue }
-        return true
+        if relative.hasSuffix(".java") { return true }
     }
     return false
 }
@@ -216,11 +221,20 @@ private func discoverJarNames(projectPath: String) -> [String] {
 /// 收集工程里可供 javac 使用的 jar（排除构建产物和内嵌 JRE）
 private func collectJavaClasspath(projectPath: String) -> [String] {
     let fm = FileManager.default
-    guard let subpaths = try? fm.subpathsOfDirectory(atPath: projectPath) else { return [] }
+    guard let enumerator = fm.enumerator(atPath: projectPath) else { return [] }
+
     var jars: [String] = []
-    for relative in subpaths where relative.hasSuffix(".jar") {
-        if isPathIgnored(relative, prefixes: javaIgnoredDirectories) { continue }
-        if isJavaRuntimePath(relative) { continue }
+    for case let relative as String in enumerator {
+        if isPathIgnored(relative, prefixes: javaIgnoredDirectories) {
+            enumerator.skipDescendants()
+            continue
+        }
+        if isJavaRuntimePath(relative) {
+            // 内嵌 JRE 整棵跳过（skipDescendants 对文件是无害的空操作）
+            enumerator.skipDescendants()
+            continue
+        }
+        if !relative.hasSuffix(".jar") { continue }
         // 自己上一次编译出的 jar 不参与 classpath
         if relative.contains(".fcm-java/") { continue }
         jars.append("\(projectPath)/\(relative)")
@@ -249,20 +263,25 @@ func buildJavaProject(projectPath: String,
         return outcome
     }
 
-    guard let subpaths = try? fm.subpathsOfDirectory(atPath: projectPath) else {
-        outcome.failure = "无法读取工程目录：\(projectPath)"
-        return outcome
-    }
-
     // ---- 1) 按 package 根分组 ----
+    // 逐个遍历并在遇到 build/JRE 目录时跳过整棵子树，避免把 JRE 的上万个文件装进内存。
     var groups: [String: [String]] = [:]
-    for relative in subpaths where relative.hasSuffix(".java") {
-        if isPathIgnored(relative, prefixes: javaIgnoredDirectories) { continue }
-        if isJavaRuntimePath(relative) { continue }
-        let full = "\(projectPath)/\(relative)"
-        let packageName = javaPackageName(of: full)
-        let root = javaPackageRoot(for: full, packageName: packageName)
-        groups[root, default: []].append(full)
+    if let enumerator = fm.enumerator(atPath: projectPath) {
+        for case let relative as String in enumerator {
+            if isPathIgnored(relative, prefixes: javaIgnoredDirectories) {
+                enumerator.skipDescendants()
+                continue
+            }
+            if isJavaRuntimePath(relative) {
+                enumerator.skipDescendants()
+                continue
+            }
+            guard relative.hasSuffix(".java") else { continue }
+            let full = "\(projectPath)/\(relative)"
+            let packageName = javaPackageName(of: full)
+            let root = javaPackageRoot(for: full, packageName: packageName)
+            groups[root, default: []].append(full)
+        }
     }
     guard !groups.isEmpty else {
         outcome.ok = true
@@ -285,6 +304,8 @@ func buildJavaProject(projectPath: String,
 
     let knownJarNames = discoverJarNames(projectPath: projectPath)
     let projectName = (projectPath as NSString).lastPathComponent
+    // classpath 只算一次：以前每个源码集都遍历一遍工程，解压 JRE 后会很慢。
+    let sharedClasspath = collectJavaClasspath(projectPath: projectPath)
     var usedNames = Set<String>()
     var sets: [JavaSourceSet] = []
 
@@ -318,7 +339,7 @@ func buildJavaProject(projectPath: String,
         sets.append(JavaSourceSet(root: root,
                                   sources: sources,
                                   jarName: jarName,
-                                  classpath: collectJavaClasspath(projectPath: projectPath)))
+                                  classpath: sharedClasspath))
     }
 
     // ---- 3) 输出目录 ----
@@ -328,10 +349,27 @@ func buildJavaProject(projectPath: String,
     cfolder(atPath: workRoot)
 
     var producedJars: [String] = []
+    let memoryFlags = javacMemoryFlags()
+    log("  javac 堆上限 \(memoryFlags.heapMB)MB，串行 GC（低内存设备保护）")
 
     for (index, set) in sets.enumerated() {
         log("编译 Java 源码集 \(index + 1)/\(sets.count)：\(set.root)")
         log("  源码 \(set.sources.count) 个 → \(set.jarName)")
+
+        let jarPath = "\(workRoot)/\(set.jarName)"
+        let stampFile = "\(workRoot)/.fcm-java-\(index).stamp"
+        let signature = javaSourceSignature(set: set, toolchain: toolchain)
+
+        // 增量编译：源码、classpath、JDK 都没变就直接复用上次的 jar。
+        // 设备上 javac 启动一次要几秒，低内存机器上尤其明显。
+        if fm.fileExists(atPath: jarPath),
+           let saved = try? String(contentsOfFile: stampFile, encoding: .utf8),
+           saved.trimmingCharacters(in: .whitespacesAndNewlines) == signature {
+            producedJars.append(jarPath)
+            outcome.notes.append("\(set.jarName)（复用，Java 8）")
+            log("  ↺ 源码未变，复用 \(set.jarName)")
+            continue
+        }
 
         let classes = "\(workRoot)/classes-\(index)"
         _ = rm(classes)
@@ -359,6 +397,7 @@ func buildJavaProject(projectPath: String,
 
         for flags in triedFlags {
             var args: [String] = [javac]
+            args.append(contentsOf: memoryFlags.args)
             args.append(contentsOf: flags)
             args.append(contentsOf: ["-encoding", "UTF-8", "-d", classes])
             if !set.classpath.isEmpty {
@@ -388,7 +427,6 @@ func buildJavaProject(projectPath: String,
             return outcome
         }
 
-        let jarPath = "\(workRoot)/\(set.jarName)"
         _ = rm(jarPath)
         var jarArgs: [String] = [jarTool, "cf", jarPath, "-C", classes, "."]
         // 保留源码根里的 META-INF（部分补丁 jar 用它声明覆盖清单）
@@ -403,6 +441,8 @@ func buildJavaProject(projectPath: String,
             return outcome
         }
 
+        // 记录指纹，下次构建时源码未变就直接复用
+        cfile(atPath: stampFile, withContent: signature + "\n")
         producedJars.append(jarPath)
         outcome.notes.append("\(set.jarName)（\(readableSize(jarPath))，Java 8）")
         log("  ✓ \(set.jarName)（\(readableSize(jarPath))）")
@@ -446,4 +486,74 @@ private func firstClassMajorVersion(in directory: String) -> Int {
         return Int(bytes[6]) << 8 | Int(bytes[7])
     }
     return 0
+}
+
+// MARK: - 低内存设备保护
+
+/// 按设备内存决定 javac 的 JVM 堆上限。
+/// javac 默认堆是物理内存的 1/4：iPhone 7/8（2GB）会拿到 512MB，
+/// 一次启动就吃掉大半可用内存，很容易被 jetsam 杀掉。
+/// 这里固定给一个够编译中小工程的上限，并改用 SerialGC：
+/// 串行 GC 线程少、堆外开销小，在 2GB 设备上比 G1 更稳。
+private func javacMemoryFlags() -> (args: [String], heapMB: Int) {
+    let mem = currentMemoryInfo()
+    let heap: Int
+    let metaspace: Int
+    if mem.total < 2400 * 1024 * 1024 {
+        heap = 256
+        metaspace = 128
+    } else if mem.total < 3300 * 1024 * 1024 {
+        heap = 384
+        metaspace = 192
+    } else if mem.total < 4400 * 1024 * 1024 {
+        heap = 512
+        metaspace = 256
+    } else {
+        heap = 768
+        metaspace = 384
+    }
+    let args = [
+        "-J-Xmx\(heap)m",
+        "-J-XX:MaxMetaspaceSize=\(metaspace)m",
+        "-J-XX:+UseSerialGC"
+    ]
+    return (args, heap)
+}
+
+// MARK: - 增量编译指纹
+
+/// 源码集指纹：jar 名、JDK 版本与参数、classpath、源码集合任一变化都会改变签名。
+/// 只读取文件大小与修改时间，不读内容；FNV-1a 保证跨进程稳定
+/// （Swift 的 hashValue 每次启动都会变，不能持久化到 stamp 文件）。
+private func javaSourceSignature(set: JavaSourceSet,
+                                 toolchain: JavaToolchainInfo) -> String {
+    let fm = FileManager.default
+
+    func entry(_ prefix: String, _ path: String) -> String {
+        let attrs = try? fm.attributesOfItem(atPath: path)
+        let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        return "\(prefix):\(path)|\(size)|\(Int(mtime))"
+    }
+
+    var parts: [String] = [
+        "jar:\(set.jarName)",
+        "root:\(set.root)",
+        "jdk:\(toolchain.version)",
+        "flags:\(toolchain.java8Flags.joined(separator: " "))"
+    ]
+    for path in set.classpath.sorted() {
+        parts.append(entry("cp", path))
+    }
+    // 源码顺序不影响编译结果，排序后参与指纹
+    for path in set.sources.sorted() {
+        parts.append(entry("src", path))
+    }
+
+    var hash: UInt32 = 2166136261
+    for byte in parts.joined(separator: "\n").utf8 {
+        hash ^= UInt32(byte)
+        hash = hash &* 16777619
+    }
+    return String(format: "%08x-%d", hash, set.sources.count)
 }

@@ -150,8 +150,17 @@ func detectJavaToolchain(projectPath: String) -> JavaToolchainInfo {
     guard !candidates.isEmpty else { return info }
 
     // ---- 4) 依次评估，优先 JDK 8 ----
+    // 按来源优先级从高到低评估：JDK 8 命中后得分必然高于任何非 8 候选
+    // （最高 40 + 300 对 40 + 200），可以立刻结束，省掉后续多次 javac 探测。
+    let ordered = candidates.enumerated().sorted {
+        if $0.element.priority != $1.element.priority {
+            return $0.element.priority > $1.element.priority
+        }
+        return $0.offset < $1.offset
+    }.map { $0.element }
+
     var best: (JavaToolchainInfo, Int)?
-    for candidate in candidates {
+    for candidate in ordered {
         var current = JavaToolchainInfo()
         current.home = candidate.home
         current.source = candidate.source
@@ -159,8 +168,13 @@ func detectJavaToolchain(projectPath: String) -> JavaToolchainInfo {
         current.jarPath = fm.fileExists(atPath: "\(candidate.home)/bin/jar")
             ? "\(candidate.home)/bin/jar" : nil
 
-        // zip 解压出来的 bin 往往没有执行位，补一次（幂等）
-        _ = shell("chmod -R +x \(shellQuote("\(candidate.home)/bin")) 2>/dev/null", uid: 501, env: [])
+        // zip 解压出来的 bin 往往没有执行位。
+        // 只在 javac 不可执行时才补，而且不做 -R 递归：
+        // 递归 chmod 一个 JDK 目录要遍历上万个文件，每次构建都做纯属浪费。
+        if !fm.isExecutableFile(atPath: "\(candidate.home)/bin/javac") {
+            _ = shell("chmod +x \(shellQuote("\(candidate.home)/bin"))/* 2>/dev/null",
+                      uid: 501, env: [])
+        }
 
         let versionResult = runCaptured("\(shellQuote(current.javacPath!)) -version", uid: 501)
         if let range = versionResult.output.range(of: "javac ") {
@@ -208,6 +222,9 @@ func detectJavaToolchain(projectPath: String) -> JavaToolchainInfo {
         if best == nil || score > best!.1 {
             best = (current, score)
         }
+
+        // JDK 8 已经满足硬条件且得分最高，不必再探测其它候选
+        if major == 8 { break }
     }
 
     if let best = best {

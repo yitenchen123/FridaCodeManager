@@ -175,14 +175,26 @@ func saveBuildState(projectPath: String, sources: [String], flagsToken: String) 
 /// 任一头文件变化就让本轮所有 ObjC 单元重编）。
 func projectHeadersFingerprint(projectPath: String, ignorePrefixes: [String]) -> String {
     let fm = FileManager.default
-    guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else { return "" }
-    let headers = all
-        .filter {
-            let ext = ($0 as NSString).pathExtension.lowercased()
-            return ext == "h" || ext == "hh" || ext == "hpp" || ext == "hxx"
+    guard let enumerator = fm.enumerator(atPath: projectPath) else { return "" }
+
+    // 用流式遍历代替 subpathsOfDirectory：工程里解压出 JRE 后有几万个文件，
+    // 全部装进数组在 2GB 设备上是实打实的内存压力。
+    var headers: [String] = []
+    for case let relative as String in enumerator {
+        if isPathIgnored(relative, prefixes: ignorePrefixes) {
+            var isDirectory: ObjCBool = false
+            if fm.fileExists(atPath: "\(projectPath)/\(relative)", isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                enumerator.skipDescendants()
+            }
+            continue
         }
-        .filter { !isPathIgnored($0, prefixes: ignorePrefixes) }
-        .sorted()
+        let ext = (relative as NSString).pathExtension.lowercased()
+        if ext == "h" || ext == "hh" || ext == "hpp" || ext == "hxx" {
+            headers.append(relative)
+        }
+    }
+    headers.sort()
 
     var combined = ""
     for header in headers {
