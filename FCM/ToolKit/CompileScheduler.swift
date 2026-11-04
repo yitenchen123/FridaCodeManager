@@ -76,6 +76,14 @@ func currentMemoryInfo() -> MemoryInfo {
         freeBytes = pages * pageSize
     }
 
+    // 系统视角之外，再看 jetsam 视角：os_proc_available_memory 返回
+    // 「本进程在被杀之前还能拿到多少」。两者取小更安全 ——
+    // 本进程自己接近上限时继续加并行，最先被杀的就是 App 本身。
+    let appAvailable = processAvailableMemory()
+    if appAvailable > 0 {
+        freeBytes = min(freeBytes, appAvailable)
+    }
+
     // 空闲页里也只有一部分能用来编译：系统会随时回收，留出安全边界。
     // 上限取总内存的 45%：再高就会把系统其它进程推到 jetsam 边缘。
     freeBytes = min(freeBytes * 3 / 4, total * 45 / 100)
@@ -87,11 +95,21 @@ func currentMemoryInfo() -> MemoryInfo {
     return MemoryInfo(total: total, free: available)
 }
 
+/// 读取 os_proc_available_memory（iOS 13 起提供）。
+/// 用 dlsym 动态查找而不是直接调用：老系统没有这个符号，
+/// 直接引用会在启动时崩溃。返回 0 表示不可用。
+private func processAvailableMemory() -> UInt64 {
+    typealias AvailableMemoryFn = @convention(c) () -> UInt64
+    guard let handle = dlopen(nil, RTLD_NOW),
+          let symbol = dlsym(handle, "os_proc_available_memory") else { return 0 }
+    let function = unsafeBitCast(symbol, to: AvailableMemoryFn.self)
+    return function()
+}
+
 // MARK: - 调度策略
 
 struct CompileScheduler {
     var parallelism: Int          // 同时运行的编译进程数
-    var batchSize: Int            // 每批处理的文件数
     var reason: String            // 决策依据（写进日志）
 
     /// 单个 clang 进程处理一个 .m / .c 的预估常驻内存。
@@ -108,36 +126,34 @@ struct CompileScheduler {
         if byMemory < 1 { byMemory = 1 }
 
         // 设备档位上限：先保证不被 jetsam，再追求速度。
-        // 2GB（iPhone 7/8）最多 2 个；3GB（iPhone X）最多 3 个。
+        // 这些只是「天花板」，真正并行度仍由上面的可用内存计算决定：
+        // 内存宽裕时用满档位，内存吃紧时自动回落到 1。
+        // 2GB（iPhone 7/8）上限 3，3GB（iPhone X）上限 4，4~5GB 上限 5，
+        // 6GB 上限 7，更大上限 8（再高收益很小，内存风险陡增）。
         let cap: Int
         if mem.total < 2400 * 1024 * 1024 {
-            cap = 2
-        } else if mem.total < 3300 * 1024 * 1024 {
             cap = 3
-        } else if mem.total < 4400 * 1024 * 1024 {
+        } else if mem.total < 3300 * 1024 * 1024 {
             cap = 4
+        } else if mem.total < 4400 * 1024 * 1024 {
+            cap = 5
+        } else if mem.total < 6600 * 1024 * 1024 {
+            cap = 7
         } else {
-            cap = 6
+            cap = 8
         }
 
         var parallelism = min(cores, byMemory, cap)
-        if parallelism > 6 { parallelism = 6 }
+        if parallelism > 8 { parallelism = 8 }
         if parallelism < 1 { parallelism = 1 }
 
-        var batchSize = 0
+        // 小工程：并行度不超过文件数，避免空转的进程槽
         if fileCount <= 40 {
-            // 小工程：一次跑完，省掉批间开销
-            batchSize = fileCount
             parallelism = min(parallelism, max(1, fileCount))
-        } else {
-            // 大工程：分批，每批不超过 并行度 × 8，给系统留出回收窗口
-            batchSize = parallelism * 8
         }
 
         let reason = "内存 \(mem.totalMB)MB（可用于编译约 \(mem.freeMB)MB），CPU \(cores) 核"
-            + " → 并行 \(parallelism)（上限 \(cap)），每批 \(batchSize) 个"
-        return CompileScheduler(parallelism: parallelism,
-                                batchSize: batchSize,
-                                reason: reason)
+            + " → 并行 \(parallelism)（上限 \(cap)）"
+        return CompileScheduler(parallelism: parallelism, reason: reason)
     }
 }

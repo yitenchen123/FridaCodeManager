@@ -156,6 +156,97 @@ func resolveAvailableSDK(_ requested: String) -> String {
     return requested
 }
 
+/// 并行编译一批 ObjC / C 编译单元，并自动串行重试被系统终止的单元。
+///
+/// 为什么单独写脚本而不是直接拼 xargs 命令：
+///   · 主阶段按内存算出的并行度跑，尽量吃满设备；
+///   · 万一某个 clang 被 jetsam 杀掉，串行重试只补被杀的那几个文件，
+///     而不是让整次构建失败重来；
+///   · 有真实编译错误（日志里有 error:）的不重试，避免无谓地再编一遍。
+///
+/// - Parameters:
+///   - failLog: 已经加好 shell 引号的失败清单路径。
+/// - Returns: 可直接追加到 EXEC 的 shell 片段。
+func parallelCompileShell(projectPath: String,
+                          units: [(source: String, object: String)],
+                          errorDir: String,
+                          failLog: String,
+                          clangCommand: String,
+                          extraFlags: String,
+                          targetTriple: String,
+                          compileFlags: (String) -> String,
+                          parallelism: Int) -> String {
+    let unitDir = "\(projectPath)/.fcm-units"
+    _ = rm(unitDir)
+    cfolder(atPath: unitDir)
+
+    func write(_ content: String, _ name: String) {
+        // 临时脚本不需要原子写：atomic 会为每个文件生成临时文件再 rename，
+        // 几百个编译单元时这笔开销反而明显。
+        _ = try? content.write(toFile: "\(unitDir)/\(name)", atomically: false, encoding: .utf8)
+    }
+
+    var commands: [String] = []
+    for (index, unit) in units.enumerated() {
+        let marker = "\(unitDir)/u\(index).fail"
+        let errName = (unit.object as NSString).lastPathComponent + ".txt"
+        let body = "rm -f " + shellQuote(unit.object)
+            + " ; " + clangCommand + " " + compileFlags(unit.source) + " " + extraFlags
+            + " -target " + targetTriple
+            + " -c " + quoted(projectPath, unit.source)
+            + " -o " + shellQuote(unit.object)
+            + " > " + shellQuote("\(errorDir)/\(errName)") + " 2>&1"
+        commands.append(body + " || touch " + shellQuote(marker))
+
+        // 重试脚本先打标记、编译成功才清除：即使重试进程本身被杀，
+        // 标记仍在，最终会被如实报告成失败。
+        write("#!/bin/sh\n"
+              + "touch " + shellQuote(marker) + " ; " + body
+              + " ; if [ $? -eq 0 ]; then rm -f " + shellQuote(marker) + " ; fi\n",
+              "u\(index).sh")
+        write(unit.source + "\n", "u\(index).src")
+        write("\(errorDir)/\(errName)\n", "u\(index).err")
+    }
+
+    let unitsFile = "\(projectPath)/.fcm-units.txt"
+    // NUL 分隔：xargs 默认会解释输入里的引号/反斜杠，
+    // 命令里的单引号路径（含空格的文件名）会被它吃掉。
+    _ = try? commands.joined(separator: "\u{0}")
+        .write(toFile: unitsFile, atomically: false, encoding: .utf8)
+
+    let runnerFile = "\(projectPath)/.fcm-run.sh"
+    let script = "#!/bin/sh\n"
+        + "UD=" + shellQuote(unitDir) + "\n"
+        + "rm -rf " + shellQuote(errorDir) + " ; mkdir -p " + shellQuote(errorDir) + "\n"
+        + "xargs -0 -P " + String(parallelism)
+        + " -I {} sh -c '{}' < " + shellQuote(unitsFile) + "\n"
+        + "for f in \"$UD\"/*.fail; do\n"
+        + "  [ -f \"$f\" ] || continue\n"
+        + "  n=${f##*/}\n"
+        + "  n=${n#u}\n"
+        + "  n=${n%.fail}\n"
+        + "  e=$(cat \"$UD/u$n.err\" 2>/dev/null)\n"
+        + "  if [ -f \"$e\" ] && grep -q 'error:' \"$e\" 2>/dev/null; then continue; fi\n"
+        + "  sh \"$UD/u$n.sh\"\n"
+        + "done\n"
+        + "for f in \"$UD\"/*.fail; do\n"
+        + "  [ -f \"$f\" ] || continue\n"
+        + "  n=${f##*/}\n"
+        + "  n=${n#u}\n"
+        + "  n=${n%.fail}\n"
+        + "  cat \"$UD/u$n.src\"\n"
+        + "done > " + failLog + "\n"
+    _ = try? script.write(toFile: runnerFile, atomically: false, encoding: .utf8)
+
+    // runner 自身输出单独落盘：failLog 只保留失败源文件清单，
+    // 否则重试过程中的任何一行输出都会被误判成编译失败。
+    let runLog = shellQuote("\(projectPath)/.fcm-run.log")
+    return "cd " + shellQuote(projectPath) + " ; rm -f " + failLog + " ; "
+        + "sh " + shellQuote(runnerFile) + " > " + runLog + " 2>&1 ; "
+        + "rm -rf " + shellQuote(runnerFile) + " " + shellQuote(unitsFile)
+        + " " + shellQuote(unitDir) + " ; "
+}
+
 func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ progress: Binding<Double>?) -> Int {
     // 工程里写的 SDK 可能在本机没有安装（常见于别人分享的工程），
     // 这里自动回退到「已安装的同系列 SDK」或「设置里的默认 SDK」，避免每次都要手动改。
@@ -487,34 +578,60 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
         #if jailbreak
         // Swift 工程：ObjC 部分先各自编译成 .o，再连同 Swift 一起交给 swiftc 链接。
         // 每次构建都清空 clang 目录，避免上一轮遗留的 .o 参与链接。
-        var objcObjectPaths: [String] = []
-        EXEC += "rm -rf " + shellQuote(info[4]) + " ; mkdir -p " + shellQuote(info[4])
-            + " " + shellQuote(errorDir) + " ; rm -f " + FAIL_LOG + " ; "
-        for mFile in MFiles {
-            let object = "\(info[4])/\(stableObjectName(mFile)).o"
-            objcObjectPaths.append(object)
-            let errLog = "\(errorDir)/\(stableObjectName(mFile)).o.txt"
-            EXEC += clangCommand + " " + compileFlags(for: mFile) + " " + apiextension.build_sub
-                + " -target " + targetTriple + " -c " + quoted(ProjectInfo.ProjectPath, mFile)
-                + " -o " + shellQuote(object)
-                + " > " + shellQuote(errLog) + " 2>&1 || echo " + shellQuote(mFile)
-                + " >> " + FAIL_LOG + " ; "
+        let objcUnits = MFiles.map { mFile in
+            (source: mFile, object: "\(info[4])/\(stableObjectName(mFile)).o")
+        }
+        let objcObjectPaths = objcUnits.map { $0.object }
+        EXEC += "rm -rf " + shellQuote(info[4]) + " ; mkdir -p " + shellQuote(info[4]) + " ; "
+        if !objcUnits.isEmpty {
+            // ObjC 部分同样并行 + 失败重试，避免混合工程里几十个 .m 串行编译
+            let objcScheduler = CompileScheduler.make(projectPath: ProjectInfo.ProjectPath,
+                                                      fileCount: objcUnits.count)
+            _ = climessenger("build-plan", "ObjC 调度：" + objcScheduler.reason)
+            EXEC += parallelCompileShell(projectPath: ProjectInfo.ProjectPath,
+                                         units: objcUnits,
+                                         errorDir: errorDir,
+                                         failLog: FAIL_LOG,
+                                         clangCommand: clangCommand,
+                                         extraFlags: apiextension.build_sub,
+                                         targetTriple: targetTriple,
+                                         compileFlags: { compileFlags(for: $0) },
+                                         parallelism: objcScheduler.parallelism)
+        } else {
+            EXEC += "rm -f " + FAIL_LOG + " ; "
         }
         EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '以下文件编译失败：'; cat " + FAIL_LOG
             + "; " + errorSummary + "exit 1; fi ; "
 
         let objectArgs = objcObjectPaths.map { shellQuote($0) }.joined(separator: " ")
-        EXEC += "swiftc " + swiftBaseFlags
-            + " " + quotedList(ProjectInfo.ProjectPath, SwiftFiles)
-            + " " + quotedList(ProjectInfo.ProjectPath, AFiles)
-            + " " + objectArgs
-            + " " + apiextension.build
-            + swiftFrameworkLinkFlags
-            + cxxRuntimeFlag
-            + " " + bridgingHeaderFlag
-            + parseAsLibrary
-            + " -o " + shellQuote(builtBinary)
+        // swiftc 默认按 CPU 核数并行前端任务，不看内存：
+        // 2GB 设备上 6 个前端同时跑很容易被 jetsam。这里用同一个调度器限流。
+        let swiftJobs = CompileScheduler.make(projectPath: ProjectInfo.ProjectPath,
+                                              fileCount: max(1, SwiftFiles.count))
+        _ = climessenger("build-plan", "Swift 调度：" + swiftJobs.reason)
+        func swiftCompileCommand(jobs: Int) -> String {
+            return "swiftc " + swiftBaseFlags
+                + " -j " + String(jobs)
+                + " " + quotedList(ProjectInfo.ProjectPath, SwiftFiles)
+                + " " + quotedList(ProjectInfo.ProjectPath, AFiles)
+                + " " + objectArgs
+                + " " + apiextension.build
+                + swiftFrameworkLinkFlags
+                + cxxRuntimeFlag
+                + " " + bridgingHeaderFlag
+                + parseAsLibrary
+                + " -o " + shellQuote(builtBinary)
+        }
+
+        // 134/137/139 = 进程被 SIGABRT/SIGKILL/SIGSEGV 终止，多半是内存不够被系统杀掉。
+        // 这时降到串行再试一次；真正的编译错误不重试，避免白白多编一遍。
+        EXEC += swiftCompileCommand(jobs: swiftJobs.parallelism)
+            + " ; RC=$? ; "
+            + "if [ $RC -eq 137 ] || [ $RC -eq 139 ]; then "
+            + "echo 'Swift 编译进程被系统终止，降为串行重试…' ; "
+            + swiftCompileCommand(jobs: 1)
             + " || { echo 'Swift 编译或链接失败'; exit 1; } ; "
+            + "elif [ $RC -ne 0 ]; then echo 'Swift 编译或链接失败'; exit 1; fi ; "
         #elseif trollstore
         print("TrollStore 版本目前不支持 Swift 工程！\n")
         return 1
@@ -548,37 +665,19 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
 
         let pending = plan.units.filter { $0.needsRebuild }
         if !pending.isEmpty {
-            let compileUnits = pending.map { unit in
-                // 错误日志按 .o 名区分；失败时把源文件写进汇总清单，
-                // 具体 error 行由脚本末尾从各自的日志里提取。
-                let errName = (unit.object as NSString).lastPathComponent + ".txt"
-                return "rm -f " + shellQuote(unit.object)
-                    + " ; " + clangCommand + " " + compileFlags(for: unit.source) + " " + apiextension.build_sub
-                    + " -target " + targetTriple
-                    + " -c " + quoted(ProjectInfo.ProjectPath, unit.source)
-                    + " -o " + shellQuote(unit.object)
-                    + " > " + quoted(ProjectInfo.ProjectPath, "./.fcm-errors/" + errName)
-                    + " 2>&1 || echo " + shellQuote(unit.source)
-            }
-            let unitsFile = "\(ProjectInfo.ProjectPath)/.fcm-units.txt"
-            // NUL 分隔：xargs 默认会解释输入里的引号/反斜杠，
-            // 命令里的单引号路径（含空格的文件名）会被它吃掉。
-            cfile(atPath: unitsFile, withContent: compileUnits.joined(separator: "\u{0}"))
-
             // 调度策略：按可用内存而非只看 CPU 核数，避免 200+ 编译单元并行时被 jetsam
             let scheduler = CompileScheduler.make(projectPath: ProjectInfo.ProjectPath,
                                                   fileCount: pending.count)
             _ = climessenger("build-plan", "调度：" + scheduler.reason)
-
-            let runnerFile = "\(ProjectInfo.ProjectPath)/.fcm-run.sh"
-            cfile(atPath: runnerFile, withContent:
-                "#!/bin/sh\nrm -rf " + shellQuote(errorDir) + " ; mkdir -p " + shellQuote(errorDir) + "\n"
-                + "xargs -0 -P " + String(scheduler.parallelism)
-                + " -I {} sh -c '{}' < " + shellQuote(unitsFile) + "\n")
-
-            EXEC += "cd " + shellQuote(ProjectInfo.ProjectPath) + " ; rm -f " + FAIL_LOG + " ; "
-            EXEC += "sh " + shellQuote(runnerFile) + " > " + FAIL_LOG + " 2>&1 ; "
-            EXEC += "rm -f " + shellQuote(runnerFile) + " " + shellQuote(unitsFile) + " ; "
+            EXEC += parallelCompileShell(projectPath: ProjectInfo.ProjectPath,
+                                         units: pending.map { (source: $0.source, object: $0.object) },
+                                         errorDir: errorDir,
+                                         failLog: FAIL_LOG,
+                                         clangCommand: clangCommand,
+                                         extraFlags: apiextension.build_sub,
+                                         targetTriple: targetTriple,
+                                         compileFlags: { compileFlags(for: $0) },
+                                         parallelism: scheduler.parallelism)
         } else {
             EXEC += "cd " + shellQuote(ProjectInfo.ProjectPath) + " ; rm -f " + FAIL_LOG + " ; "
         }

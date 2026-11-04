@@ -58,37 +58,57 @@ func buildHeaderMap(projectPath: String, ignorePrefixes: [String] = []) -> Heade
     let fm = FileManager.default
     let mapDir = "\(global_container)/tmp/fcm-headermap-\(stableHash(projectPath))"
 
-    _ = rm(mapDir)
+    // 不再每次 rm -rf 重建：索引目录里只是符号链接，
+    // 按需补缺/纠正比先删后建快得多（大工程每次能省几百次 unlink+symlink）。
     cfolder(atPath: mapDir)
 
     var result = HeaderMapResult(directory: mapDir, count: 0, conflicts: [])
-    var seen = Set<String>()
-
-    guard let all = try? fm.subpathsOfDirectory(atPath: projectPath) else {
-        return result
-    }
+    var expected: [String: String] = [:]
 
     // 排除构建产物与版本控制目录
     let ignoredPrefixes = makeBuildIgnoreList("") + ignorePrefixes + [".xcodeproj"]
 
-    for file in all where file.hasSuffix(".h") || file.hasSuffix(".hh") || file.hasSuffix(".hpp") {
-        if isPathIgnored(file, prefixes: ignoredPrefixes) { continue }
-        // 跳过 .xcodeproj 内部
-        if file.contains(".xcodeproj/") { continue }
+    guard let enumerator = fm.enumerator(atPath: projectPath) else {
+        return result
+    }
+
+    // 流式遍历：工程带 JRE / Pods 时，subpathsOfDirectory 会一次性
+    // 把几万个路径装进数组，2GB 设备上白白吃内存。
+    for case let file as String in enumerator {
+        if isPathIgnored(file, prefixes: ignoredPrefixes) {
+            var isDirectory: ObjCBool = false
+            if fm.fileExists(atPath: "\(projectPath)/\(file)", isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                enumerator.skipDescendants()
+            }
+            continue
+        }
+        guard file.hasSuffix(".h") || file.hasSuffix(".hh") || file.hasSuffix(".hpp") else {
+            continue
+        }
 
         let name = (file as NSString).lastPathComponent
 
         // 同名头文件：保留第一个（与 Xcode header map 行为一致，后写覆盖但会警告）
-        if seen.contains(name) {
+        if expected[name] != nil {
             if !result.conflicts.contains(name) {
                 result.conflicts.append(name)
             }
             continue
         }
-        seen.insert(name)
+        expected[name] = "\(projectPath)/\(file)"
+    }
 
-        let source = "\(projectPath)/\(file)"
+    for (name, source) in expected {
         let target = "\(mapDir)/\(name)"
+
+        // 已有且指向同一文件：直接跳过
+        if let existing = try? fm.destinationOfSymbolicLink(atPath: target), existing == source {
+            result.count += 1
+            continue
+        }
+
+        _ = rm(target)
 
         // 优先用符号链接（零拷贝）；不支持则复制
         do {
@@ -98,6 +118,13 @@ func buildHeaderMap(projectPath: String, ignorePrefixes: [String] = []) -> Heade
             if cp(source, target) == 0 {
                 result.count += 1
             }
+        }
+    }
+
+    // 清掉上一轮遗留、当前工程里已不存在的头文件索引
+    if let leftovers = try? fm.contentsOfDirectory(atPath: mapDir) {
+        for name in leftovers where expected[name] == nil {
+            _ = rm("\(mapDir)/\(name)")
         }
     }
 
