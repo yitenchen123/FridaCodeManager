@@ -108,23 +108,92 @@ struct BuildFailure {
 struct CommandResult {
     var code: Int
     var output: String
+    var timedOut: Bool = false
+    var timeoutReason: String = ""
     var succeeded: Bool { return code == 0 }
 }
 
+/// 读取文件当前字节数（空闲检测的进度基准）
+private func fileByteSize(_ path: String) -> Int {
+    let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+    return ((attrs?[.size] as? NSNumber)?.intValue) ?? 0
+}
+
 /// 执行 shell 命令并捕获输出。绝不静默失败。
-func runCaptured(_ command: String, uid: uid_t = 501, env: [String] = [], timeout: Int = 900) -> CommandResult {
+///
+/// - Parameters:
+///   - liveOutput: 把命令的标准输出实时回显到日志。
+///     编译这类长任务必须打开：以前全部重定向进临时文件、结束后才一次性打印，
+///     界面会在十几分钟里停在「编译」且没有任何新日志，看起来就是卡死。
+///   - idleTimeout: 连续多少秒没有任何新输出就判定卡死并杀掉整个进程组。
+func runCaptured(_ command: String, uid: uid_t = 501, env: [String] = [],
+                 timeout: Int = 0, idleTimeout: Int = 0,
+                 liveOutput: Bool = false) -> CommandResult {
     // 所有临时文件都落在 container/tmp 下；这里必须确保目录存在，
     // 否则重定向本身就会失败，命令还没跑就返回非零。
     cfolder(atPath: "\(global_container)/tmp")
     let logPath = "\(global_container)/tmp/fcm-cmd-\(UUID()).log"
+    // 先建空文件：重定向不会因文件不存在失败，空闲检测一开始也有可靠的基准大小。
+    _ = FileManager.default.createFile(atPath: logPath, contents: nil)
     let wrapped = command + " > '" + logPath + "' 2>&1"
-    let code = shell(wrapped, uid: uid, env: env)
+
+    var consumed = 0
+    let started = Date()
+    var lastEmit = Date()
+
+    func pump() -> Int {
+        let size = fileByteSize(logPath)
+        if size > consumed {
+            if let handle = FileHandle(forReadingAtPath: logPath) {
+                handle.seek(toFileOffset: UInt64(consumed))
+                let data = handle.readDataToEndOfFile()
+                handle.closeFile()
+                consumed += data.count
+                if liveOutput {
+                    let text = String(decoding: data, as: UTF8.self)
+                    for line in text.split(separator: "\n") {
+                        let trimmed = line.trimmingCharacters(in: .whitespaces)
+                        if !trimmed.isEmpty { print(trimmed) }
+                    }
+                }
+            }
+            lastEmit = Date()
+        } else if liveOutput, Date().timeIntervalSince(lastEmit) >= 15 {
+            // swiftc / 链接这类单进程阶段本身没有输出，用心跳证明它还活着
+            print("⏳ 进行中… 已用时 \(Int(Date().timeIntervalSince(started)))s")
+            lastEmit = Date()
+        }
+        return size
+    }
+
+    let outcome: ShellOutcome
+    if liveOutput || timeout > 0 || idleTimeout > 0 {
+        outcome = shellMonitored(wrapped, uid: uid, env: env,
+                                 timeout: timeout, idleTimeout: idleTimeout,
+                                 progress: pump)
+    } else {
+        outcome = ShellOutcome(code: shell(wrapped, uid: uid, env: env),
+                               timedOut: false, reason: "")
+    }
+
+    // 命令结束后把轮询间隔里最后几行补上
+    _ = pump()
+
     var text = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
-    _ = rm(logPath)
     if text.count > 4000 {
         text = "…（前面省略）\n" + String(text.suffix(4000))
     }
-    return CommandResult(code: code, output: text.trimmingCharacters(in: .whitespacesAndNewlines))
+    // 编译这类长任务失败时保留完整日志：界面只回显了一部分，
+    // 而“卡在哪一个文件/哪一条链接参数”往往要看完整输才找得到。
+    if outcome.code != 0 && liveOutput {
+        print("完整日志已保留：\(logPath)")
+    } else {
+        _ = rm(logPath)
+    }
+    return CommandResult(code: outcome.code,
+                         output: text.trimmingCharacters(in: .whitespacesAndNewlines),
+                         timedOut: outcome.timedOut,
+                         timeoutReason: outcome.reason)
 }
 
 /// 把字节数格式化成人类可读的大小

@@ -196,13 +196,20 @@ func parallelCompileShell(projectPath: String,
             + " -c " + quoted(projectPath, unit.source)
             + " -o " + shellQuote(unit.object)
             + " > " + shellQuote("\(errorDir)/\(errName)") + " 2>&1"
-        commands.append(body + " || touch " + shellQuote(marker))
+        // 每个单元结束时打一行到主日志：clang 的详细输出都在各自的 .err 里，
+        // 不打这一行的话整段编译对界面就是一片空白，看起来像卡死。
+        let done = "echo " + shellQuote("  ✓ " + unit.source)
+        let failed = "echo " + shellQuote("  ✗ " + unit.source) + " ; touch " + shellQuote(marker)
+        commands.append(body + " ; RC=$? ; if [ $RC -eq 0 ]; then " + done
+                        + " ; else " + failed + " ; fi")
 
         // 重试脚本先打标记、编译成功才清除：即使重试进程本身被杀，
         // 标记仍在，最终会被如实报告成失败。
         write("#!/bin/sh\n"
               + "touch " + shellQuote(marker) + " ; " + body
-              + " ; if [ $? -eq 0 ]; then rm -f " + shellQuote(marker) + " ; fi\n",
+              + " ; if [ $? -eq 0 ]; then rm -f " + shellQuote(marker)
+              + " ; echo " + shellQuote("  ↺ ✓ " + unit.source) + " ; "
+              + "else echo " + shellQuote("  ↺ ✗ " + unit.source) + " ; fi\n",
               "u\(index).sh")
         write(unit.source + "\n", "u\(index).src")
         write("\(errorDir)/\(errName)\n", "u\(index).err")
@@ -238,11 +245,10 @@ func parallelCompileShell(projectPath: String,
         + "done > " + failLog + "\n"
     _ = try? script.write(toFile: runnerFile, atomically: false, encoding: .utf8)
 
-    // runner 自身输出单独落盘：failLog 只保留失败源文件清单，
-    // 否则重试过程中的任何一行输出都会被误判成编译失败。
-    let runLog = shellQuote("\(projectPath)/.fcm-run.log")
+    // runner 不再把输出藏进 .fcm-run.log：进度行必须走构建脚本的标准输出，
+    // 才能被 runCaptured 的 liveOutput 实时回显到界面。
     return "cd " + shellQuote(projectPath) + " ; rm -f " + failLog + " ; "
-        + "sh " + shellQuote(runnerFile) + " > " + runLog + " 2>&1 ; "
+        + "sh " + shellQuote(runnerFile) + " ; "
         + "rm -rf " + shellQuote(runnerFile) + " " + shellQuote(unitsFile)
         + " " + shellQuote(unitDir) + " ; "
 }
@@ -577,19 +583,34 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     if !SwiftFiles.isEmpty {
         #if jailbreak
         // Swift 工程：ObjC 部分先各自编译成 .o，再连同 Swift 一起交给 swiftc 链接。
-        // 每次构建都清空 clang 目录，避免上一轮遗留的 .o 参与链接。
-        let objcUnits = MFiles.map { mFile in
-            (source: mFile, object: "\(info[4])/\(stableObjectName(mFile)).o")
-        }
-        let objcObjectPaths = objcUnits.map { $0.object }
-        EXEC += "rm -rf " + shellQuote(info[4]) + " ; mkdir -p " + shellQuote(info[4]) + " ; "
-        if !objcUnits.isEmpty {
+        // 这里同样走增量：Air2 这类工程有 200+ 个 .m，
+        // 每改一行 Swift 就全量重编 ObjC，会让每次构建都退化成首次构建的速度。
+        let token = flagsToken(macro: ProjectInfo.Macro,
+                               sdk: ProjectInfo.SDK,
+                               target: targetTriple,
+                               headerFlags: headerFlags,
+                               extraFlags: compileFlags(for: "")
+                                    + "|cpp:" + clangLanguageStandardFlags(from: xcodeConfig, forCpp: true)
+                                    + "|" + (usesARC ? "arc" : "noarc")
+                                    + "|headers:" + projectHeadersFingerprint(projectPath: ProjectInfo.ProjectPath,
+                                                                              ignorePrefixes: ignoreList))
+        incrementalToken = token
+        let objcPlan = planCompilation(projectPath: ProjectInfo.ProjectPath,
+                                       sources: MFiles,
+                                       objectDir: info[4],
+                                       flagsToken: token,
+                                       forceFull: false)
+        let pendingObjects = objcPlan.units.filter { $0.needsRebuild }
+        EXEC += "mkdir -p " + shellQuote(info[4]) + " ; "
+        if !pendingObjects.isEmpty {
             // ObjC 部分同样并行 + 失败重试，避免混合工程里几十个 .m 串行编译
             let objcScheduler = CompileScheduler.make(projectPath: ProjectInfo.ProjectPath,
-                                                      fileCount: objcUnits.count)
-            _ = climessenger("build-plan", "ObjC 调度：" + objcScheduler.reason)
+                                                      fileCount: pendingObjects.count)
+            _ = climessenger("build-plan",
+                             "ObjC 调度：" + objcScheduler.reason
+                             + "（\(MFiles.count) 个源文件，需重编 \(pendingObjects.count) 个，复用 \(objcPlan.reused) 个）")
             EXEC += parallelCompileShell(projectPath: ProjectInfo.ProjectPath,
-                                         units: objcUnits,
+                                         units: pendingObjects.map { (source: $0.source, object: $0.object) },
                                          errorDir: errorDir,
                                          failLog: FAIL_LOG,
                                          clangCommand: clangCommand,
@@ -598,12 +619,12 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
                                          compileFlags: { compileFlags(for: $0) },
                                          parallelism: objcScheduler.parallelism)
         } else {
-            EXEC += "rm -f " + FAIL_LOG + " ; "
+            EXEC += "cd " + shellQuote(ProjectInfo.ProjectPath) + " ; rm -f " + FAIL_LOG + " ; "
         }
         EXEC += "if [ -s " + FAIL_LOG + " ]; then echo '以下文件编译失败：'; cat " + FAIL_LOG
             + "; " + errorSummary + "exit 1; fi ; "
 
-        let objectArgs = objcObjectPaths.map { shellQuote($0) }.joined(separator: " ")
+        let objectArgs = objcPlan.units.map { shellQuote($0.object) }.joined(separator: " ")
         // swiftc 默认按 CPU 核数并行前端任务，不看内存：
         // 2GB 设备上 6 个前端同时跑很容易被 jetsam。这里用同一个调度器限流。
         let swiftJobs = CompileScheduler.make(projectPath: ProjectInfo.ProjectPath,
@@ -786,17 +807,27 @@ func build(_ ProjectInfo: Project,_ erase: Bool,_ status: Binding<String>?,_ pro
     #if !stock
     compileEnv = bashenv
     #endif
-    let compileResult = runCaptured(shellQuote(buildScript), uid: 501, env: compileEnv)
-    _ = rm(buildScript)
+    print("开始编译…（首次构建会编译全部源文件，比增量构建慢很多）")
+    // liveOutput：把编译进度实时打到界面，否则这里会安静十几分钟，看起来就是卡死。
+    // 只设总时长兜底，不做“无输出即判定卡死”：swiftc 编译大工程时可能
+    // 长时间不打印任何东西，按输出判死会误杀正在正常工作的编译。
+    let compileResult = runCaptured(shellQuote(buildScript), uid: 501, env: compileEnv,
+                                    timeout: 3600, liveOutput: true)
 
     if !compileResult.succeeded {
-        _ = climessenger("compiler-stage", "编译或链接失败")
-        if !compileResult.output.isEmpty {
-            _ = climessenger("compiler-output", compileResult.output)
+        if compileResult.timedOut {
+            _ = climessenger("compiler-stage", "编译被终止：" + compileResult.timeoutReason)
+            if !compileResult.output.isEmpty {
+                _ = climessenger("compiler-output", compileResult.output)
+            }
+        } else {
+            _ = climessenger("compiler-stage", "编译或链接失败（上方最后几行是编译器输出）")
         }
+        _ = climessenger("compiler-stage", "构建脚本保留在 " + buildScript + " 便于排查")
         _ = rm(info[0])
         return 1
     }
+    _ = rm(buildScript)
     _ = climessenger("compiler-stage", "编译完成")
 
     // 编译成功后才写增量状态；失败时保留旧状态，下次会重新编译受影响文件。
